@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Graphwar Solver (auto-capture, full overlay, multi-bridge)
-----------------------------------------------------------
-- ALWAYS captures the primary monitor (mss)
-- Detects the playfield, obstacles (mask + contours), players
-- Identifies the current shooter by red aura (filters out name-tag badges)
-- Plans a single-valued path (monotone in x) that visits enemies on one side
-  while avoiding obstacles (grid A*). Pins the polyline through enemy points.
-- Converts the (simplified) path into a sum of bridge primitives:
-    Diagonal: a*(|x+b| - |x+c|)
-    Step:     k/(1+exp(-a*(x+c)))   [a=55]
-- Overlay shows EXACTLY what the solver believes (actors, obstacles, chosen path).
-- Prints the final expression to paste in Graphwar.
-
-Dependencies:
-    pip install opencv-python mss numpy
-"""
 import argparse
 import json
 import math
@@ -29,19 +12,22 @@ try:
 except Exception:
     cv2 = None
 
-# -------- Screenshot (always-on) --------
-def capture_fullscreen(output_path: str = "graphwar_capture.png") -> str:
-    """Capture the primary monitor and save to output_path."""
-    try:
-        import mss, mss.tools
-    except Exception as e:
-        raise RuntimeError("Screenshot capture requires the 'mss' package. Install with: pip install mss") from e
-    with mss.mss() as sct:
-        sct_img = sct.grab(sct.monitors[1])  # primary monitor
-        mss.tools.to_png(sct_img.rgb, sct_img.size, output=output_path)
-    return output_path
-# ----------------------------------------
+ENEMY_RADIUS = 0.8   # graph units of "leeway" to count as a hit/target band
+X_GROUP_TOL  = 0.6   # enemies whose x differ <= this are grouped into a column
 
+# ---------- Capture ----------
+def capture_fullscreen_bgr() -> np.ndarray:
+    """Return a BGR numpy image of the primary monitor (no file saved)."""
+    try:
+        import mss
+    except Exception as e:
+        raise RuntimeError("Screenshot capture requires: pip install mss") from e
+    with mss.mss() as sct:
+        sct_img = sct.grab(sct.monitors[1])  # primary
+        frame = np.array(sct_img)            # BGRA
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+# ---------- Data ----------
 @dataclass
 class Board:
     x0: int
@@ -55,7 +41,7 @@ class Board:
         x_min, x_max = self.x_range
         y_min, y_max = self.y_range
         x = x_min + (px / self.w) * (x_max - x_min)
-        y = y_max - (py / self.h) * (y_max - y_min)  # image y down, graph y up
+        y = y_max - (py / self.h) * (y_max - y_min)
         return x, y
 
     def xy_to_px(self, x: float, y: float) -> Tuple[int, int]:
@@ -74,18 +60,16 @@ class Actor:
     py: int
     area: int = 0
 
-# ---------- Board ROI ----------
+# ---------- ROI ----------
 def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
     if cv2 is None:
-        raise RuntimeError("This script requires OpenCV (cv2). Please install opencv-python.")
+        raise RuntimeError("This script requires OpenCV (cv2).")
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    lower = np.array([0, 0, 200])
-    upper = np.array([179, 45, 255])
-    mask_white = cv2.inRange(hsv, lower, upper)
+    mask_white = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([179, 45, 255]))
     mask_white = cv2.morphologyEx(mask_white, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
     contours, _ = cv2.findContours(mask_white, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        raise RuntimeError("Couldn't find a white board region in the screenshot.")
+        raise RuntimeError("Couldn't find a white board region.")
     cnt = max(contours, key=cv2.contourArea)
     x,y,w,h = cv2.boundingRect(cnt)
     roi = img_bgr[y:y+h, x:x+w].copy()
@@ -94,7 +78,6 @@ def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
 
 # ---------- Name tags ----------
 def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
-    """Return bounding boxes of white-ish rectangles (player name tags)."""
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([0, 0, 210]), np.array([179, 40, 255]))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
@@ -104,7 +87,7 @@ def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
         x,y,w,h = cv2.boundingRect(c)
         area = w*h
         ar = w / max(1, h)
-        if 200 <= area <= 8000 and ar >= 1.2:
+        if 200 <= area <= 8000 and ar >= 1.1:
             boxes.append((x,y,w,h))
     return boxes
 
@@ -115,7 +98,7 @@ def close_to_any_label(px:int, py:int, labels:List[Tuple[int,int,int,int]], max_
             return True
     return False
 
-# ---------- Obstacles (mask + contours) ----------
+# ---------- Obstacles ----------
 def _remove_axes(mask: np.ndarray) -> np.ndarray:
     edges = cv2.Canny(mask, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=200,
@@ -131,11 +114,30 @@ def obstacle_mask_and_contours(roi_bgr: np.ndarray):
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5,5), np.uint8), iterations=1)
     mask = _remove_axes(mask)
+    # subtract name tags (dilated)
+    boxes = detect_white_labels(roi_bgr)
+    label_mask = np.zeros_like(mask)
+    for (x,y,w,h) in boxes:
+        pad = 10
+        cv2.rectangle(label_mask, (max(0,x-pad), max(0,y-pad)),
+                      (min(mask.shape[1]-1, x+w+pad), min(mask.shape[0]-1, y+h+pad)),
+                      255, thickness=cv2.FILLED)
+    mask[label_mask > 0] = 0
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     kept = [c for c in contours if cv2.contourArea(c) >= 200]
     mask_clean = np.zeros_like(mask)
     cv2.drawContours(mask_clean, kept, -1, 255, thickness=cv2.FILLED)
     return mask_clean, kept
+
+def add_border_as_obstacle(mask: np.ndarray, border_px: int = 8) -> np.ndarray:
+    h, w = mask.shape[:2]
+    border = np.zeros_like(mask)
+    cv2.rectangle(border, (0,0), (w-1,h-1), 255, thickness=border_px)
+    return cv2.bitwise_or(mask, border)
+
+def inflate_for_safety(mask: np.ndarray, px: int = 2) -> np.ndarray:
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (px, px))
+    return cv2.dilate(mask, k, iterations=1)
 
 # ---------- Actors ----------
 def detect_actors(roi_bgr: np.ndarray, min_area: int=60) -> List[Actor]:
@@ -165,67 +167,82 @@ def assign_coords(board: Board, actors: List[Actor]) -> None:
     for a in actors:
         a.x, a.y = board.px_to_xy(a.px, a.py)
 
-def choose_soldier_positional(actors: List[Actor], team_hint: str="left") -> Optional[Actor]:
+def classify_by_center(actors: List[Actor]) -> None:
+    for a in actors:
+        a.side = "ally" if a.x < 0 else "enemy"
+
+# ---------- Red aura detection ----------
+def red_mask(roi_bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    low1, high1 = np.array([0,  60, 70]),  np.array([12,255,255])
+    low2, high2 = np.array([168,60, 70]),  np.array([179,255,255])
+    m = cv2.bitwise_or(cv2.inRange(hsv, low1, high1), cv2.inRange(hsv, low2, high2))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=1)
+    return m
+
+def choose_shooter_by_red_ring(roi_bgr: np.ndarray, actors: List[Actor]) -> Optional[Actor]:
     if not actors:
         return None
-    return min(actors, key=lambda t: t.x) if team_hint == "left" else max(actors, key=lambda t: t.x)
-
-def pick_shooter_by_red_aura(roi_bgr: np.ndarray, actors: List[Actor]) -> Optional[Actor]:
-    if cv2 is None or not actors:
+    rm = red_mask(roi_bgr)
+    if int((rm>0).sum()) < 20:
         return None
-    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    low1, high1 = np.array([0,120,120]),   np.array([10,255,255])
-    low2, high2 = np.array([170,120,120]), np.array([179,255,255])
-    mask_red = cv2.bitwise_or(cv2.inRange(hsv, low1, high1), cv2.inRange(hsv, low2, high2))
-    mask_red = cv2.medianBlur(mask_red, 5)
 
-    labels = detect_white_labels(roi_bgr)
-    best = None; best_score = 0
+    best = None
+    best_score = 0.0
+    R_IN, R_OUT = 6, 30
+    NBINS = 36
+
     for a in actors:
-        if a.area < 200 and close_to_any_label(a.px, a.py, labels, max_dist=32):
+        h, w = rm.shape
+        y, x = a.py, a.px
+        y0, y1 = max(0, y-R_OUT), min(h, y+R_OUT+1)
+        x0, x1 = max(0, x-R_OUT), min(w, x+R_OUT+1)
+        sub = rm[y0:y1, x0:x1]
+        if sub.size == 0:
             continue
-        rr_inner, rr_outer = 6, 28
-        h, w = mask_red.shape[:2]
-        y,x = a.py, a.px
-        y0 = max(0, y-rr_outer); y1 = min(h, y+rr_outer+1)
-        x0 = max(0, x-rr_outer); x1 = min(w, x+rr_outer+1)
-        sub = mask_red[y0:y1, x0:x1]
-        yy, xx = np.ogrid[y0:y1, x0:x1]
-        dist2 = (yy - y)**2 + (xx - x)**2
-        donut = (dist2 <= rr_outer**2) & (dist2 >= rr_inner**2)
-        score = int((sub > 0)[donut].sum())
-        if score > best_score:
-            best_score = score; best = a
-    return best if (best is not None and best_score >= 20) else None
 
-def classify_sides(actors: List[Actor], soldier: Actor) -> None:
-    for a in actors:
-        if a is soldier:
-            a.side = "ally"
-        else:
-            a.side = "ally" if (a.x <= 0 and soldier.x <= 0) or (a.x >= 0 and soldier.x >= 0) else "enemy"
+        yy, xx = np.ogrid[y0:y1, x0:x1]
+        d2 = (yy - y)**2 + (xx - x)**2
+        donut = (d2 <= R_OUT**2) & (d2 >= R_IN**2)
+        reds = (sub > 0) & donut
+        cnt = int(reds.sum())
+        if cnt == 0:
+            continue
+
+        ys, xs = np.nonzero(reds)
+        ang = np.arctan2((ys + y0) - y, (xs + x0) - x)
+        bins = ((ang + np.pi) / (2*np.pi) * NBINS).astype(int)
+        bins = np.clip(bins, 0, NBINS-1)
+        coverage = np.unique(bins).size / NBINS
+        score = cnt * (coverage**1.5)
+        if coverage >= 0.25 and score > best_score:
+            best_score = score
+            best = a
+    return best
+
+def choose_leftmost(actors: List[Actor]) -> Optional[Actor]:
+    return min(actors, key=lambda t: t.x) if actors else None
 
 # ---------- Bridge math ----------
 def diagonal_params_from_line(xs: float, xe: float, slope_m: float) -> Tuple[float, float, float]:
     start, end = (xs, xe) if xs < xe else (xe, xs)
-    a = abs(slope_m) / 2.0     # slope = ±2a over [start,end]
+    a = abs(slope_m) / 2.0
     if slope_m >= 0:
         b, c = -start, -end
     else:
         b, c = -end, -start
     return a, b, c
 
-# pick bridge per segment
 def segment_to_bridge(x1: float, y1: float, x2: float, y2: float) -> Tuple[str, Dict]:
     dx = x2 - x1
     dy = y2 - y1
-    if abs(dx) >= 0.4:  # regular slanted piece -> diagonal
-        m = dy / dx
+    if abs(dx) >= 0.45:  # slanted piece -> diagonal
+        m = dy / dx if dx != 0 else 0.0
         a,b,c = diagonal_params_from_line(x1, x2, m)
         term = f"{a:.4f}*(abs(x+({b:+.4f}))-abs(x+({c:+.4f})))"
         return term, {"type":"diagonal","a":a,"b":b,"c":c,"start":x1,"end":x2,"slope":m}
-    else:
-        # mostly vertical -> step at x1 (positive k raises, negative lowers)
+    else:               # near-vertical -> step
         k = dy
         a = 55.0
         c = -x1
@@ -233,253 +250,272 @@ def segment_to_bridge(x1: float, y1: float, x2: float, y2: float) -> Tuple[str, 
         return term, {"type":"step","k":k,"a":a,"c":c,"x_at":x1}
 
 def build_expression_from_polyline(pts: List[Tuple[float,float]]) -> Tuple[str, List[Dict]]:
-    if len(pts) < 2:
-        return "0", []
-    parts = []
-    meta: List[Dict] = []
+    if len(pts) < 2: return "0", []
+    parts, meta = [], []
     for i in range(1, len(pts)):
         (x1,y1),(x2,y2) = pts[i-1], pts[i]
-        if abs(x2-x1) < 1e-9 and abs(y2-y1) < 1e-9:
-            continue
+        if abs(x2-x1) < 1e-9 and abs(y2-y1) < 1e-9: continue
         term, info = segment_to_bridge(x1,y1,x2,y2)
-        parts.append(term)
-        meta.append(info)
+        parts.append(term); meta.append(info)
     expr = " + ".join(parts)
-    # simple cleanups
-    expr = expr.replace("+-","-").replace("--","+")
-    return expr, meta
+    return expr.replace("+-","-").replace("--","+"), meta
 
-# ---------- Grid planning (monotone A*) ----------
-def build_occupancy(board: Board, obs_mask: np.ndarray, dx: float=0.25, dy: float=0.25):
-    xs = np.arange(board.x_range[0], board.x_range[1] + 1e-6, dx)
-    ys = np.arange(board.y_range[0], board.y_range[1] + 1e-6, dy)
-    occ = np.zeros((len(ys), len(xs)), dtype=np.uint8)  # 1=blocked
+# ---------- RDP with anchors ----------
+def rdp_segment(points: List[Tuple[float,float]], eps: float) -> List[Tuple[float,float]]:
+    if len(points) < 3:
+        return points[:]
+    def dist(p, a, b):
+        (x,y),(x1,y1),(x2,y2) = p,a,b
+        if x1==x2 and y1==y2: return math.hypot(x-x1, y-y1)
+        t = ((x-x1)*(x2-x1)+(y-y1)*(y2-y1))/((x2-x1)**2+(y2-y1)**2)
+        t = max(0.0, min(1.0, t))
+        xp, yp = x1 + t*(x2-x1), y1 + t*(y2-y1)
+        return math.hypot(x-xp, y-yp)
+    a, b = points[0], points[-1]
+    idx, dmax = 0, 0.0
+    for i in range(1, len(points)-1):
+        d = dist(points[i], a, b)
+        if d > dmax: idx, dmax = i, d
+    if dmax > eps:
+        left = rdp_segment(points[:idx+1], eps)
+        right = rdp_segment(points[idx:], eps)
+        return left[:-1] + right
+    else:
+        return [a, b]
+
+def rdp_with_anchors(points: List[Tuple[float,float]], anchor_idx: List[int], eps: float) -> List[Tuple[float,float]]:
+    """Simplify while forcing anchors to remain."""
+    anchor_idx = sorted(set([max(0,min(len(points)-1,i)) for i in anchor_idx]))
+    if not anchor_idx: return rdp_segment(points, eps)
+    out = []
+    for a,b in zip(anchor_idx[:-1], anchor_idx[1:]):
+        seg = points[a:b+1]
+        simp = rdp_segment(seg, eps)
+        if out:
+            out.extend(simp[1:])
+        else:
+            out.extend(simp)
+    return out
+
+# ---------- Grid + A* ----------
+def build_occupancy_and_cost(board: Board, obs_mask: np.ndarray,
+                             dx: float=0.20, dy: float=0.20, w_prox: float=4.0):
+    xs = np.arange(board.x_range[0], board.x_range[1] + 1e-9, dx)
+    ys = np.arange(board.y_range[0], board.y_range[1] + 1e-9, dy)
+    free = (obs_mask == 0).astype(np.uint8)*255
+    dist = cv2.distanceTransform(free, cv2.DIST_L2, 5)
+    dist_norm = dist / dist.max() if dist.max() > 0 else dist
+    occ  = np.zeros((len(ys), len(xs)), dtype=np.uint8)
+    cost = np.zeros_like(occ, dtype=np.float32)
     for j, y in enumerate(ys):
         for i, x in enumerate(xs):
             px, py = board.xy_to_px(x, y)
             px = int(np.clip(px, 0, board.w-1)); py = int(np.clip(py, 0, board.h-1))
-            occ[j, i] = 1 if (obs_mask is not None and obs_mask[py, px] > 0) else 0
-    return xs, ys, occ
+            blocked = obs_mask[py, px] > 0
+            occ[j, i] = 1 if blocked else 0
+            prox = 1.0 - float(dist_norm[py, px])  # 0 far, 1 near
+            cost[j, i] = 1.0 + w_prox * (prox**2)
+    return xs, ys, occ, cost
 
 def nearest_idx(xs, ys, x, y):
     i = int(np.clip(np.searchsorted(xs, x), 0, len(xs)-1))
     j = int(np.clip(np.searchsorted(ys, y), 0, len(ys)-1))
     return i, j
 
-def astar_monotone(xs, ys, occ, start, goal, dir_sign: int):
-    """A* that only moves forward in x (dir_sign=+1 right, -1 left)."""
+def snap_to_free(occ: np.ndarray, i: int, j: int, max_r: int = 6) -> Tuple[int,int]:
+    if 0 <= j < occ.shape[0] and 0 <= i < occ.shape[1] and occ[j, i] == 0:
+        return i, j
+    best = None; bestd = 1e9
+    for r in range(1, max_r+1):
+        for dj in range(-r, r+1):
+            for di in (-r, r):
+                ni, nj = i+di, j+dj
+                if 0 <= nj < occ.shape[0] and 0 <= ni < occ.shape[1] and occ[nj, ni] == 0:
+                    d = di*di + dj*dj
+                    if d < bestd: bestd, best = d, (ni, nj)
+        for di in range(-r+1, r):
+            for dj in (-r, r):
+                ni, nj = i+di, j+dj
+                if 0 <= nj < occ.shape[0] and 0 <= ni < occ.shape[1] and occ[nj, ni] == 0:
+                    d = di*di + dj*dj
+                    if d < bestd: bestd, best = d, (ni, nj)
+        if best is not None: return best
+    ys, xs = np.where(occ == 0)
+    if len(xs):
+        k = int(np.argmin((xs - i)**2 + (ys - j)**2))
+        return int(xs[k]), int(ys[k])
+    return i, j
+
+def astar_monotone(xs, ys, occ, cost, start, goal, dir_sign: int, w_turn: float=0.12):
     from heapq import heappush, heappop
     si, sj = start; gi, gj = goal
     W, H = len(xs), len(ys)
-    moves = [(dir_sign, 0), (dir_sign, +1), (dir_sign, -1)]
+    moves = [(dir_sign, 0), (dir_sign, +1), (dir_sign, -1), (0, +1), (0, -1)]
     g = { (si,sj): 0.0 }
     came = {}
     pq = []
-    def h(i,j):  # L1 distance
-        return abs(gi - i) + abs(gj - j)
-    heappush(pq, (h(si,sj), (si,sj)))
+    def h(i,j): return abs(gi - i) + abs(gj - j)
+    heappush(pq, (h(si,sj), (si,sj), (0,0)))
     seen=set()
     while pq:
-        _, (i,j) = heappop(pq)
-        if (i,j) in seen: 
-            continue
+        _, (i,j), prev = heappop(pq)
+        if (i,j) in seen: continue
         seen.add((i,j))
         if i == gi and j == gj:
-            # reconstruct
-            path=[]
-            cur=(i,j)
+            path=[]; cur=(i,j)
             while cur in came:
-                path.append(cur)
-                cur=came[cur]
-            path.append((si,sj))
-            path.reverse()
+                path.append(cur); cur=came[cur]
+            path.append((si,sj)); path.reverse()
             return [(xs[ii], ys[jj]) for (ii,jj) in path]
         for di, dj in moves:
             ni, nj = i+di, j+dj
-            if ni<0 or ni>=W or nj<0 or nj>=H: 
-                continue
-            if occ[nj, ni]: 
-                continue
-            if (dir_sign==+1 and ni<i) or (dir_sign==-1 and ni>i):
-                continue
-            newg = g[(i,j)] + 1.0
+            if ni<0 or ni>=W or nj<0 or nj>=H: continue
+            if occ[nj, ni]: continue
+            if (dir_sign==+1 and ni<i) or (dir_sign==-1 and ni>i): continue
+            step = cost[nj, ni]
+            if prev != (0,0) and (di, dj) != prev: step += w_turn
+            newg = g[(i,j)] + float(step)
             if (ni,nj) not in g or newg < g[(ni,nj)]:
-                g[(ni,nj)] = newg
-                came[(ni,nj)] = (i,j)
-                heappush(pq, (newg + h(ni,nj), (ni,nj)))
-    return []  # no path
+                g[(ni,nj)] = newg; came[(ni,nj)] = (i,j)
+                heappush(pq, (newg + h(ni,nj), (ni,nj), (di,dj)))
+    return []
 
+# ---------- Enemy grouping by x ----------
+def group_enemies_by_x(enemies_xy: List[Tuple[float,float]], start_x: float, x_tol: float=X_GROUP_TOL):
+    """Return list of columns; each column is a list of (x,y). Only enemies with x >= start_x."""
+    cand = [p for p in enemies_xy if p[0] >= start_x]
+    cand.sort(key=lambda p: p[0])
+    cols: List[List[Tuple[float,float]]] = []
+    cur: List[Tuple[float,float]] = []
+    cur_x = None
+    for x,y in cand:
+        if cur_x is None or abs(x - cur_x) <= x_tol:
+            cur.append((x,y))
+            cur_x = x if cur_x is None else (cur_x + x)/2.0
+        else:
+            cols.append(cur); cur = [(x,y)]; cur_x = x
+    if cur: cols.append(cur)
+    return cols
+
+# ---------- Plan path (anchors recorded) ----------
 def plan_path(board: Board, obs_mask: np.ndarray, soldier_xy: Tuple[float,float],
-              enemies_xy: List[Tuple[float,float]], direction: str) -> List[Tuple[float,float]]:
-    """Plan path from shooter to every enemy on one side (x-order, monotone)."""
-    if not enemies_xy:
-        return []
-    dir_sign = +1 if direction=="right" else -1
-    xs, ys, occ = build_occupancy(board, obs_mask, dx=0.25, dy=0.25)
+              enemies_xy: List[Tuple[float,float]]) -> Tuple[List[Tuple[float,float]], List[int]]:
+    xs, ys, occ, cost = build_occupancy_and_cost(board, obs_mask, dx=0.20, dy=0.20, w_prox=4.0)
     sx, sy = soldier_xy
-    path_total: List[Tuple[float,float]] = []
+    cols = group_enemies_by_x(enemies_xy, start_x=sx, x_tol=X_GROUP_TOL)
+
+    path: List[Tuple[float,float]] = [(sx, sy)]
+    anchors: List[int] = [0]  # keep start
     curx, cury = sx, sy
-    # order targets
-    enemies_sorted = sorted(enemies_xy, key=lambda p: p[0], reverse=(dir_sign==-1))
-    for (tx, ty) in enemies_sorted:
-        si, sj = nearest_idx(xs, ys, curx, cury)
-        gi, gj = nearest_idx(xs, ys, tx, ty)
-        seg = astar_monotone(xs, ys, occ, (si,sj), (gi,gj), dir_sign)
-        if not seg:
-            continue
-        if path_total:
-            seg = seg[1:]  # drop duplicate join
-        path_total.extend(seg)
-        # pin EXACT enemy point
-        if not path_total or (abs(path_total[-1][0]-tx)>1e-6 or abs(path_total[-1][1]-ty)>1e-6):
-            path_total.append((tx, ty))
-        curx, cury = tx, ty
-    # ensure unique and strictly increasing x (within direction)
-    cleaned = []
-    lastx = None
-    for (x,y) in path_total:
-        if lastx is not None and abs(x-lastx) < 1e-6:
-            continue
-        cleaned.append((x,y))
-        lastx = x
-    return cleaned
 
-# ---------- Simplify + Expression ----------
-def simplify_polyline(pl: List[Tuple[float,float]], slope_tol: float=0.08) -> List[Tuple[float,float]]:
-    if len(pl) <= 2: return pl
-    simp = [pl[0]]
-    for p in pl[1:]:
-        if abs(p[0]-simp[-1][0]) < 1e-9 and abs(p[1]-simp[-1][1]) < 1e-9:
-            continue
-        if len(simp) >= 2:
-            m_prev = (simp[-1][1]-simp[-2][1])/(simp[-1][0]-simp[-2][0] + 1e-9)
-            m_new  = (p[1]-simp[-1][1])/(p[0]-simp[-1][0] + 1e-9)
-            if abs(m_new - m_prev) < slope_tol:
-                simp[-1] = p
-                continue
-        simp.append(p)
-    return simp
+    for col in cols:
+        # one x for the column (max x so we never go backwards)
+        xg = max(p[0] for p in col)
+        ig, _ = nearest_idx(xs, ys, xg, cury)
+        # visit enemies in this column by nearest vertical order
+        remaining = col[:]
+        while remaining:
+            remaining.sort(key=lambda p: abs(p[1] - cury))
+            tx, ty = remaining.pop(0)
+            si, sj = nearest_idx(xs, ys, curx, cury)
+            gi, gj = ig, nearest_idx(xs, ys, xg, ty)[1]
+            si, sj = snap_to_free(occ, si, sj, max_r=6)
+            gi, gj = snap_to_free(occ, gi, gj, max_r=6)
+            seg = astar_monotone(xs, ys, occ, cost, (si,sj), (gi,gj), dir_sign=+1, w_turn=0.12)
+            if seg:
+                if path: seg = seg[1:]
+                path.extend(seg)
+                anchors.append(len(path)-1)  # anchor at this target
+                curx, cury = path[-1]
+            else:
+                # as a fallback, just “teleport” anchor to desired grid node
+                path.append((xs[gi], ys[gj])); anchors.append(len(path)-1)
+                curx, cury = xs[gi], ys[gj]
 
-# ---------- Main solver ----------
-def solve(image_path: str, team_hint: str="left",
-          x_range: Tuple[float,float]=(-25.0,25.0), y_range: Tuple[float,float]=(-15.0,15.0),
-          tolerance: float=0.75, min_area: int=60, debug_out: Optional[str]=None) -> dict:
+    return path, anchors
+
+# ---------- Solve ----------
+def solve_from_bgr(bgr: np.ndarray,
+                   x_range: Tuple[float,float]=(-25.0,25.0), y_range: Tuple[float,float]=(-15.0,15.0),
+                   min_area: int=60, overlay_path: Optional[str]=None) -> dict:
     if cv2 is None:
-        raise RuntimeError("OpenCV (cv2) is required to run this script.")
-    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise FileNotFoundError(f"Could not read screenshot: {image_path}")
+        raise RuntimeError("OpenCV (cv2) is required.")
     board, roi = find_board_roi(bgr)
     board.x_range = x_range; board.y_range = y_range
 
-    obs_mask, obs_contours = obstacle_mask_and_contours(roi)
+    obs_mask_raw, obs_contours = obstacle_mask_and_contours(roi)
+    obs_mask_with_border = add_border_as_obstacle(obs_mask_raw, border_px=8)
+    obs_mask_plan = inflate_for_safety(obs_mask_with_border, px=2)
 
     actors_all = detect_actors(roi, min_area=min_area)
     actors = filter_out_name_badges(roi, actors_all)
     assign_coords(board, actors)
+    classify_by_center(actors)
 
-    # shooter: prefer red aura, otherwise positional hint
-    soldier = pick_shooter_by_red_aura(roi, actors) or choose_soldier_positional(actors, team_hint=team_hint)
-    if soldier is None:
+    shooter = choose_shooter_by_red_ring(roi, actors)
+    if shooter is None:
+        left_allies = [a for a in actors if a.side == "ally"]
+        shooter = choose_leftmost(left_allies) or choose_leftmost(actors)
+    if shooter is None:
         raise RuntimeError("No actors detected.")
-    classify_sides(actors, soldier)
 
-    enemies = [a for a in actors if a.side == "enemy"]
-    allies  = [a for a in actors if a.side == "ally" and a is not soldier]
+    enemies_xy = [(a.x, a.y) for a in actors if a.side == "enemy"]
 
-    # plan path for each side, pin through enemies
-    def side_plan(side: str):
-        if side=="right":
-            targets = [(e.x, e.y) for e in enemies if e.x >= soldier.x]
-        else:
-            targets = [(e.x, e.y) for e in enemies if e.x <= soldier.x]
-        poly = plan_path(board, obs_mask, (soldier.x, soldier.y), targets, side) if targets else []
-        # count hits against pinned targets
-        hits = 0
-        for (tx,ty) in targets:
-            if any(abs(px-tx)<=1e-6 and abs(py-ty)<=1e-6 for (px,py) in poly):
-                hits += 1
-        return poly, hits
+    raw_path, anchor_idx = plan_path(board, obs_mask_plan, (shooter.x, shooter.y), enemies_xy)
+    # simplify but keep anchors (enemies)
+    path = rdp_with_anchors(raw_path, anchor_idx, eps=0.40)
+    expr, _ = build_expression_from_polyline(path)
 
-    poly_r, hits_r = side_plan("right")
-    poly_l, hits_l = side_plan("left")
-    if hits_r > hits_l:
-        chosen_side, poly = "right", poly_r
-    else:
-        chosen_side, poly = "left", poly_l
+    # Overlay (only one path)
+    if overlay_path:
+        overlay = roi.copy()
+        if obs_contours:
+            cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)  # obstacles (green)
+        h, w = obs_mask_with_border.shape[:2]
+        cv2.rectangle(overlay, (0,0), (w-1,h-1), (0,255,0), 2)        # border obstacle
 
-    if not poly:
-        # simple fallback: straight segment toward farthest enemy (or 5 units forward)
-        far = max(enemies, key=lambda e: abs(e.x - soldier.x)) if enemies else None
-        target = (far.x, far.y) if far else (soldier.x + 5.0, soldier.y)
-        poly = [(soldier.x, soldier.y), target]
+        # draw actors + enemy hit radii
+        for a in actors:
+            if a is shooter:
+                cv2.circle(overlay, (a.px, a.py), 18, (0,215,255), 3)
+                cv2.putText(overlay, "S", (a.px+10, a.py-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,215,255), 2, cv2.LINE_AA)
+            else:
+                color = (0,0,255) if a.side=="enemy" else (255,0,0)
+                label = "E" if a.side=="enemy" else "A"
+                cv2.circle(overlay, (a.px, a.py), 6, color, 2)
+                cv2.putText(overlay, label, (a.px+8, a.py-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+            # hit radius for enemies
+            if a.side == "enemy":
+                rpx = int((ENEMY_RADIUS / (board.x_range[1]-board.x_range[0])) * board.w)
+                cv2.circle(overlay, (a.px, a.py), max(6,rpx), (0,140,255), 1)
 
-    # simplify & convert to expression
-    poly_simplified = simplify_polyline(poly, slope_tol=0.08)
-    expr, bridge_meta = build_expression_from_polyline(poly_simplified)
+        # final path only
+        if len(path) >= 2:
+            pts_px = [board.xy_to_px(x,y) for (x,y) in path]
+            for i in range(1, len(pts_px)):
+                cv2.line(overlay, pts_px[i-1], pts_px[i], (0,0,255), 2)
 
-    # ---- Overlay: EXACT solver view ----
-    overlay = roi.copy()
-    # obstacles
-    if obs_contours:
-        cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)  # green outline
+        cv2.imwrite(overlay_path, overlay)
 
-    # actors
-    for a in actors:
-        color = (0,0,255) if a.side=="enemy" else (255,128,0) if a is soldier else (255,0,0)  # enemies red, shooter amber ring, allies blue-ish
-        base = (0,0,255) if a.side=="enemy" else (255,0,0)
-        if a is soldier:
-            cv2.circle(overlay, (a.px, a.py), 18, (0,215,255), 3)  # gold ring
-            cv2.putText(overlay, "S", (a.px+10, a.py-10), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,215,255), 2, cv2.LINE_AA)
-        else:
-            cv2.circle(overlay, (a.px, a.py), 6, base, 2)
-            cv2.putText(overlay, "E" if a.side=="enemy" else "A", (a.px+8, a.py-8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, base, 1, cv2.LINE_AA)
+    out_actors = [{"x":float(a.x),"y":float(a.y),"side":a.side,"is_shooter":(a is shooter)} for a in actors]
+    return {"actors": out_actors, "expr": expr if expr.strip() else "0"}
 
-    # full planned path
-    if poly and len(poly) >= 2:
-        pts_px = [board.xy_to_px(x,y) for (x,y) in poly]
-        for i in range(1, len(pts_px)):
-            cv2.line(overlay, pts_px[i-1], pts_px[i], (0,0,255), 2)
-    # simplified path used for expression
-    if len(poly_simplified) >= 2:
-        pts_px_s = [board.xy_to_px(x,y) for (x,y) in poly_simplified]
-        for i in range(1, len(pts_px_s)):
-            cv2.line(overlay, pts_px_s[i-1], pts_px_s[i], (30,30,200), 2)
-
-    if debug_out:
-        cv2.imwrite(debug_out, overlay)
-
-    debug_actors = [{"x":float(a.x),"y":float(a.y),"side":a.side,"is_shooter":(a is soldier)} for a in actors]
-    return {
-        "expr": expr if expr.strip() else "0",
-        "side": chosen_side,
-        "soldier": {"x": float(soldier.x), "y": float(soldier.y)},
-        "hits_right": hits_r, "hits_left": hits_l,
-        "actors": debug_actors,
-        "polyline_points": poly_simplified,
-        "bridges": bridge_meta,
-        "debug_overlay": debug_out or ""
-    }
-
+# ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser(description="Graphwar solver (auto-capture, full overlay)")
-    parser.add_argument("--team", choices=["left","right"], default="left", help="Which side your team spawns on")
+    parser = argparse.ArgumentParser(description="Graphwar solver (single-path overlay)")
     parser.add_argument("--xrange", nargs=2, type=float, default=[-25.0, 25.0], help="x-min x-max (graph units)")
     parser.add_argument("--yrange", nargs=2, type=float, default=[-15.0, 15.0], help="y-min y-max (graph units)")
-    parser.add_argument("--tolerance", type=float, default=0.75, help="hit tolerance in graph units")
     parser.add_argument("--min_area", type=int, default=60, help="min blob area to treat as an actor")
     parser.add_argument("--debug_out", default="graphwar_overlay.png", help="Path to save overlay PNG")
     args = parser.parse_args()
 
-    screenshot_path = capture_fullscreen("graphwar_capture.png")
-    res = solve(
-        image_path=screenshot_path,
-        team_hint=args.team,
+    bgr = capture_fullscreen_bgr()
+    res = solve_from_bgr(
+        bgr,
         x_range=(args.xrange[0], args.xrange[1]),
         y_range=(args.yrange[0], args.yrange[1]),
-        tolerance=args.tolerance,
         min_area=args.min_area,
-        debug_out=(args.debug_out if args.debug_out else None)
+        overlay_path=(args.debug_out if args.debug_out else None)
     )
     print(json.dumps(res, indent=2))
 

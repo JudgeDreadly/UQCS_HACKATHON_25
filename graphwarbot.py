@@ -21,26 +21,30 @@ GRID_DX         = 0.20     # A* grid step (x)
 GRID_DY         = 0.20     # A* grid step (y)
 PROX_WEIGHT     = 6.0      # bias to center of free space (squared)
 TURN_PENALTY    = 0.20     # extra cost when changing move direction
-
-# orientation bias (favor horizontal)
-ORIENT_PENALTY_VERT = 0.20  # vertical moves slightly worse
-ORIENT_BONUS_HORZ   = 0.15  # bonus for pure +x
+ORIENT_PENALTY_VERT = 0.20
+ORIENT_BONUS_HORZ   = 0.15
 
 BORDER_THICK_PX = 8         # map border as obstacle
-INFLATE_PX      = 2         # safety inflation (pixels)
-INFLATE_PX_LO   = 1         # looser retry inflation
+INFLATE_PX      = 2         # safety inflation (pixels) — obstacles only
+INFLATE_PX_LO   = 1         # looser retry inflation — obstacles only
 
-# segment -> primitive
-VERT_EPS_X      = 0.45      # if |dx| < this -> near-vertical (use step)
+SHRINK_STEPS    = 6         # up to N erosions (1px each step) — obstacles only
+
+MIN_THICK_PX    = 6.0       # < this ⇒ very thin (likely text/label strokes)
+
+VERT_EPS_X      = 0.45      # near-vertical threshold (units)
 STEP_STEEPNESS  = 55.0      # 'a' for logistic step
 
-# Flex (hearts)
+SMOOTH_ITERS    = 3
+SMOOTH_STEP_PX  = 1.5
+SMOOTH_MAX_DY   = 2.0
+
 HEART_REQ_W     = 10.0
 HEART_REQ_H     = 10.0
 HEART_GATE_A    = 80.0
 HEART_GATE_D    = 0.5
 
-BEST_EFFORT_MAX_EXPANSIONS = 120000  # cap to keep searches bounded
+BEST_EFFORT_MAX_EXPANSIONS = 120000
 # --------------------------------------------------
 
 # ---------- capture ----------
@@ -89,12 +93,10 @@ def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
     roi = img_bgr[y:y+h, x:x+w].copy()
     return Board(x0=x, y0=y, w=w, h=h, x_range=(-25.0,25.0), y_range=(-15.0,15.0)), roi
 
-# ---------- name tags (to subtract from obstacles) ----------
+# ---------- label detection & thin-stroke removal ----------
 def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
-    """Find white/near-white nameboxes (with light saturation)."""
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    # allow a bit more saturation to catch tints/shadows around the label
-    mask = cv2.inRange(hsv, np.array([0, 0, 190]), np.array([179, 70, 255]))
+    mask = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([179, 120, 255]))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     boxes=[]
@@ -102,25 +104,28 @@ def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
         x,y,w,h = cv2.boundingRect(c)
         area = w*h
         ar = w/max(1,h)
-        if 150<=area<=12000 and ar>=1.05:
+        if 100<=area<=20000 and ar>=1.03:
             boxes.append((x,y,w,h))
     return boxes
 
-def erase_labels_from_mask(mask: np.ndarray, roi_bgr: np.ndarray, pad:int=24, dilate:int=22) -> np.ndarray:
-    """Erase name tags AND their nearby dark glyphs/shadows from obstacle mask."""
+def remove_thin_dark_near_labels(obstacles_mask: np.ndarray, roi_bgr: np.ndarray,
+                                 pad:int=24, dilate:int=50) -> np.ndarray:
     boxes = detect_white_labels(roi_bgr)
-    if not boxes: return mask
-    lab = np.zeros_like(mask)
+    if not boxes:
+        return obstacles_mask
+    er = cv2.erode(obstacles_mask, np.ones((3,3), np.uint8), iterations=1)
+    thin = cv2.bitwise_and(obstacles_mask, cv2.bitwise_not(er))
+    region = np.zeros_like(obstacles_mask)
     for (x,y,w,h) in boxes:
         x0=max(0,x-pad); y0=max(0,y-pad)
-        x1=min(mask.shape[1]-1,x+w+pad); y1=min(mask.shape[0]-1,y+h+pad)
-        cv2.rectangle(lab,(x0,y0),(x1,y1),255,thickness=cv2.FILLED)
+        x1=min(obstacles_mask.shape[1]-1, x+w+pad); y1=min(obstacles_mask.shape[0]-1, y+h+pad)
+        cv2.rectangle(region,(x0,y0),(x1,y1),255,thickness=cv2.FILLED)
     if dilate>0:
         k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(2*dilate+1,2*dilate+1))
-        lab=cv2.dilate(lab,k,iterations=1)
-    out=mask.copy()
-    out[lab>0]=0
-    return out
+        region=cv2.dilate(region,k,iterations=1)
+    cleaned = obstacles_mask.copy()
+    cleaned[(region>0) & (thin>0)] = 0
+    return cleaned
 
 # ---------- obstacles ----------
 def _remove_axes(mask: np.ndarray) -> np.ndarray:
@@ -132,29 +137,65 @@ def _remove_axes(mask: np.ndarray) -> np.ndarray:
             cv2.line(mask, (x1,y1), (x2,y2), 0, 5)
     return mask
 
+def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float=MIN_THICK_PX) -> np.ndarray:
+    # Correct unpack order: num, labels
+    num, labels = cv2.connectedComponents(shape_mask)
+    keep = np.zeros_like(shape_mask)
+    for i in range(1, num):
+        comp = np.uint8(labels == i) * 255
+        area = int((comp > 0).sum())
+        if area < 80:
+            continue
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        cnt = max(cnts, key=cv2.contourArea)
+        per = cv2.arcLength(cnt, True)
+        circularity = 4 * math.pi * cv2.contourArea(cnt) / (per * per + 1e-9)
+        dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+        thick = float(dist.max())
+        if thick >= min_thick_px or (circularity >= 0.60 and area >= 150):
+            keep = cv2.bitwise_or(keep, comp)
+    return keep
+
 def obstacle_mask_and_contours(roi_bgr: np.ndarray):
-    """Dark obstacles (circles/blobs); axes removed; labels erased."""
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 85, 255, cv2.THRESH_BINARY_INV)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5,5), np.uint8), iterations=1)
+    """Dark obstacles from HSV V<60, axes removed, labels’ thin strokes erased, thin comps filtered."""
+    hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    v = hsv[:,:,2]
+    mask = np.uint8((v < 60) * 255)  # true black fill only
+
+    # Close small holes inside obstacles, but keep kernel tiny so we don't bridge gaps
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=1)
+
     mask = _remove_axes(mask)
-    mask = erase_labels_from_mask(mask, roi_bgr, pad=24, dilate=22)
+    mask = remove_thin_dark_near_labels(mask, roi_bgr, pad=24, dilate=50)
+    mask = _keep_by_thickness(mask, MIN_THICK_PX)
+
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    kept = [c for c in contours if cv2.contourArea(c)>=200]
     clean = np.zeros_like(mask)
-    cv2.drawContours(clean, kept, -1, 255, thickness=cv2.FILLED)
-    return clean, kept
+    cv2.drawContours(clean, contours, -1, 255, thickness=cv2.FILLED)
+    return clean, contours
 
-def add_border_as_obstacle(mask: np.ndarray, px:int=BORDER_THICK_PX)->np.ndarray:
-    h,w = mask.shape[:2]; b = np.zeros_like(mask)
-    cv2.rectangle(b,(0,0),(w-1,h-1),255,thickness=px)
-    return cv2.bitwise_or(mask,b)
+def add_border_mask(shape: Tuple[int,int], px:int=BORDER_THICK_PX)->np.ndarray:
+    h,w = shape
+    border = np.zeros((h,w), dtype=np.uint8)
+    cv2.rectangle(border,(0,0),(w-1,h-1),255,thickness=px)
+    return border
 
-def inflate_for_safety(mask: np.ndarray, px:int=INFLATE_PX)->np.ndarray:
+def inflate(mask: np.ndarray, px:int)->np.ndarray:
     if px<=0: return mask.copy()
     k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(px,px))
     return cv2.dilate(mask,k,iterations=1)
+
+def shrink_obstacles_only(obs_no_border: np.ndarray, steps:int)->List[np.ndarray]:
+    out=[]; cur=obs_no_border.copy()
+    if steps<=0: return out
+    k=cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3))
+    for _ in range(steps):
+        cur = cv2.erode(cur, k, iterations=1)
+        out.append(cur.copy())
+    return out
 
 # ---------- actors ----------
 def detect_actors(roi_bgr: np.ndarray, min_area:int=60)->List[Actor]:
@@ -169,18 +210,6 @@ def detect_actors(roi_bgr: np.ndarray, min_area:int=60)->List[Actor]:
         cx,cy=cent[i]
         out.append(Actor(x=0.0,y=0.0,side="unknown",px=int(cx),py=int(cy),area=area))
     return out
-
-def filter_out_name_badges(roi_bgr: np.ndarray, actors: List[Actor])->List[Actor]:
-    boxes = detect_white_labels(roi_bgr); keep=[]
-    for a in actors:
-        # ditch tiny color specks sitting on top of a label
-        near=False
-        for (x,y,w,h) in boxes:
-            cx,cy=x+w//2,y+h//2
-            if (a.px-cx)**2+(a.py-cy)**2 <= (36**2): near=True; break
-        if near and a.area<220: continue
-        keep.append(a)
-    return keep
 
 def assign_coords(board: Board, actors: List[Actor])->None:
     for a in actors:
@@ -243,10 +272,7 @@ def segment_to_bridge(x1: float, y1: float, x2: float, y2: float) -> Tuple[str, 
         a,b,c = diagonal_params_from_line(x1, x2, m)
         term = f"{a:.4f}*(abs(x+({b:+.4f}))-abs(x+({c:+.4f})))"
         return term, {"type":"diagonal","a":a,"b":b,"c":c,"start":x1,"end":x2,"slope":m}
-    # near-vertical -> STEP (logistic)
-    k = dy
-    a = STEP_STEEPNESS
-    c = -x1
+    k = dy; a = STEP_STEEPNESS; c = -x1
     term = f"{k:.4f}/(1+exp(-{a:.0f}*(x+({c:+.4f}))))"
     return term, {"type":"step","k":k,"a":a,"c":c,"x_at":x1}
 
@@ -340,7 +366,6 @@ def snap_to_free(occ,i,j,max_r:int=6)->Tuple[int,int]:
     return i,j
 
 def astar_monotone(xs,ys,occ,cost,start,goal,dir_sign:int):
-    """Monotone A*: advances in +x; prefers horizontal; can drop early."""
     from heapq import heappush, heappop
     si,sj=start; gi,gj=goal
     W,H=len(xs),len(ys)
@@ -375,8 +400,6 @@ def astar_monotone(xs,ys,occ,cost,start,goal,dir_sign:int):
     return []
 
 def best_effort_toward(xs,ys,occ,cost,start,goal,dir_sign:int, max_exp:int=BEST_EFFORT_MAX_EXPANSIONS):
-    """A*-like exploration without success criterion; returns path to the visited node
-       with the smallest f = g + h (closest reachable cell toward goal)."""
     from heapq import heappush, heappop
     si,sj=start; gi,gj=goal
     W,H=len(xs),len(ys)
@@ -405,7 +428,6 @@ def best_effort_toward(xs,ys,occ,cost,start,goal,dir_sign:int, max_exp:int=BEST_
                 g[(ni,nj)] = newg
                 came[(ni,nj)] = (i,j)
                 heappush(pq,(newg + h(ni,nj),(ni,nj),(di,dj)))
-    # reconstruct to best_node
     path=[]; cur=best_node
     while cur in came:
         path.append(cur); cur=came[cur]
@@ -424,64 +446,86 @@ def group_enemies_by_x(enemies_xy: List[Tuple[float,float]], start_x: float, x_t
     if cur: cols.append(cur)
     return cols
 
+# ---------- smoothing ----------
+def smooth_path_away_from_obstacles(board: Board,
+                                    path: List[Tuple[float,float]],
+                                    dist_map: np.ndarray,
+                                    obs_mask: np.ndarray) -> List[Tuple[float,float]]:
+    if len(path)<3: return path[:]
+    smoothed = path[:]
+    dm = cv2.GaussianBlur(dist_map.astype(np.float32), (0,0), 1.0)
+    gy, gx = np.gradient(dm)
+    units_per_px_x = (board.x_range[1]-board.x_range[0])/board.w
+    units_per_px_y = (board.y_range[1]-board.y_range[0])/board.h
+    for _ in range(SMOOTH_ITERS):
+        for i in range(1, len(smoothed)-1):
+            x,y = smoothed[i]
+            px,py = board.xy_to_px(x,y)
+            px=np.clip(px,0,board.w-1); py=np.clip(py,0,board.h-1)
+            gxv = float(gx[py,px]); gyv = float(gy[py,px])
+            mag = math.hypot(gxv, gyv)
+            if mag < 1e-6: continue
+            dx_px = (gxv/mag)*SMOOTH_STEP_PX
+            dy_px = -(gyv/mag)*SMOOTH_STEP_PX
+            dx = dx_px*units_per_px_x
+            dy = dy_px*units_per_px_y
+            nx = max(smoothed[i-1][0]+1e-4, min(smoothed[i+1][0]-1e-4, x + max(0.0, dx)))
+            ny = y + np.clip(dy, -SMOOTH_MAX_DY, SMOOTH_MAX_DY)
+            npx,npy = board.xy_to_px(nx,ny)
+            npx=np.clip(npx,0,board.w-1); npy=np.clip(npy,0,board.h-1)
+            if obs_mask[npy,npx]==0:
+                smoothed[i]=(nx,ny)
+    return smoothed
+
 # ---------- plan path ----------
+def try_route_variants(board, base_masks: List[np.ndarray],
+                       start_xy: Tuple[float,float], goal_xy: Tuple[float,float],
+                       require_progress: bool=True) -> List[Tuple[float,float]]:
+    sx,sy=start_xy; gx,gy=goal_xy
+    best=[]
+    for mask in base_masks:
+        xs,ys,occ,cost,_ = build_occupancy_and_cost(board, mask, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
+        si,sj=nearest_idx(xs,ys,sx,sy); gi,gj=nearest_idx(xs,ys,gx,gy)
+        si,sj=snap_to_free(occ,si,sj,6); gi,gj=snap_to_free(occ,gi,gj,6)
+        seg=astar_monotone(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
+        if seg and (not require_progress or (seg[-1][0]-sx) >= GRID_DX*2):
+            return seg
+        seg=best_effort_toward(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
+        if seg and (seg[-1][0]-sx) > (best[-1][0]-sx if best else 0.0):
+            best=seg
+    return best
+
 def plan_path(board: Board,
               obs_mask_main: np.ndarray,
               soldier_xy: Tuple[float,float],
               enemies_xy: List[Tuple[float,float]],
-              obs_mask_loose: Optional[np.ndarray]=None
-              ) -> Tuple[List[Tuple[float,float]], List[int], np.ndarray]:
-    xs,ys,occ,cost,dist = build_occupancy_and_cost(board, obs_mask_main, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
-    if obs_mask_loose is not None:
-        xsL,ysL,occL,costL,_ = build_occupancy_and_cost(board, obs_mask_loose, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
-    else:
-        xsL=ysL=occL=costL=None
+              obs_mask_loose: Optional[np.ndarray]=None,
+              shrink_list: Optional[List[np.ndarray]]=None
+              ) -> Tuple[List[Tuple[float,float]], List[int], np.ndarray, np.ndarray]:
+    xs0,ys0,occ0,cost0,dist_safe = build_occupancy_and_cost(board, obs_mask_main, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
 
     sx,sy=soldier_xy
     cols=group_enemies_by_x(enemies_xy,start_x=sx,x_tol=X_GROUP_TOL)
 
     path=[(sx,sy)]; anchors=[0]; curx,cury=sx,sy
     for col in cols:
-        xg=max(p[0] for p in col)             # column x (rightmost in the group)
-        ig,_=nearest_idx(xs,ys,xg,cury)       # main-grid i for target column
+        xg=max(p[0] for p in col)
         remaining=col[:]
-        reached_any=False
         while remaining:
             remaining.sort(key=lambda p: abs(p[1]-cury))
             tx,ty=remaining.pop(0)
-
-            # --- 1) main exact ---
-            si,sj=nearest_idx(xs,ys,curx,cury)
-            gi,gj=ig, nearest_idx(xs,ys,xg,ty)[1]
-            si,sj=snap_to_free(occ,si,sj,max_r=6); gi,gj=snap_to_free(occ,gi,gj,max_r=6)
-            seg=astar_monotone(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
-
-            # --- 2) loose exact ---
-            if not seg and xsL is not None:
-                siL,sjL=nearest_idx(xsL,ysL,curx,cury)
-                giL,gjL=nearest_idx(xsL,ysL,xg,ty)
-                siL,sjL=snap_to_free(occL,siL,sjL,max_r=6); giL,gjL=snap_to_free(occL,giL,gjL,max_r=6)
-                seg=astar_monotone(xsL,ysL,occL,costL,(siL,sjL),(giL,gjL),dir_sign=+1)
-
-            # --- 3) main best-effort ---
-            if not seg:
-                seg=best_effort_toward(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
-
-            # --- 4) loose best-effort ---
-            if not seg and xsL is not None:
-                seg=best_effort_toward(xsL,ysL,occL,costL,(siL,sjL),(giL,gjL),dir_sign=+1)
-
+            mask_variants=[obs_mask_main]
+            if obs_mask_loose is not None: mask_variants.append(obs_mask_loose)
+            if shrink_list: mask_variants.extend(shrink_list)
+            seg = try_route_variants(board, mask_variants, (curx,cury), (xg,ty), require_progress=True)
             if seg:
                 if path: seg=seg[1:]
                 path.extend(seg); anchors.append(len(path)-1)
                 curx,cury=path[-1]
-                reached_any=True
-            # else: unreachable even best-effort; try next target in the same column
+        # if none worked, this column is skipped
+    return path,anchors,dist_safe,obs_mask_main
 
-        # if entire column unreachable, we skip it and continue to the next column
-    return path,anchors,dist
-
-# ---------- flex hearts ----------
+# ---------- hearts ----------
 def heart_term(a: float, L: float, R: float, scale: float) -> str:
     h=(f"0.4*((abs(x-({a:.4f}))-1.5)-abs(abs(x-({a:.4f}))-1.5))"
        f"+sqrt(2.25-(1.5+0.4*((abs(x-({a:.4f}))-1.5)-abs(abs(x-({a:.4f}))-1.5)))^2)*cos(30*x)")
@@ -525,18 +569,27 @@ def solve_from_bgr(bgr: np.ndarray,
                    min_area: int=60, overlay_path: Optional[str]=None, flex: bool=False)->dict:
     if cv2 is None: raise RuntimeError("Requires OpenCV.")
     board,roi = find_board_roi(bgr); board.x_range=x_range; board.y_range=y_range
-    # obstacles
+
+    # obstacles from HSV black
     obs_raw,obs_contours = obstacle_mask_and_contours(roi)
-    obs_bord = add_border_as_obstacle(obs_raw, px=BORDER_THICK_PX)
-    obs_main = inflate_for_safety(obs_bord, px=INFLATE_PX)
-    obs_loose= inflate_for_safety(obs_bord, px=INFLATE_PX_LO)
+
+    # world border (never inflated)
+    border_only = add_border_mask(obs_raw.shape, px=BORDER_THICK_PX)
+
+    # inflate ONLY obstacles, then OR with border -> gaps near wall preserved
+    obs_infl_main  = inflate(obs_raw, INFLATE_PX)
+    obs_infl_loose = inflate(obs_raw, INFLATE_PX_LO)
+    obs_main  = cv2.bitwise_or(obs_infl_main,  border_only)
+    obs_loose = cv2.bitwise_or(obs_infl_loose, border_only)
+
+    # progressive shrink (obstacles only), then re-add border
+    shrinks = shrink_obstacles_only(obs_raw, SHRINK_STEPS)
+    shrink_variants = [cv2.bitwise_or(s, border_only) for s in shrinks]
 
     # actors
-    actors_all = detect_actors(roi, min_area=min_area)
-    actors     = filter_out_name_badges(roi, actors_all)
+    actors = detect_actors(roi, min_area=min_area)
     assign_coords(board, actors); classify_by_center(actors)
 
-    # shooter
     shooter = choose_shooter_by_red_ring(roi, actors)
     if shooter is None:
         left_allies=[a for a in actors if a.side=="ally"]
@@ -545,17 +598,26 @@ def solve_from_bgr(bgr: np.ndarray,
 
     enemies_xy=[(a.x,a.y) for a in actors if a.side=="enemy"]
 
-    # plan (with loose & best-effort fallbacks)
-    raw_path, anchors, dist_map = plan_path(board, obs_main, (shooter.x, shooter.y),
-                                            enemies_xy, obs_mask_loose=obs_loose)
-    path = rdp_with_anchors(raw_path, anchors, eps=RDP_EPS)
+    # plan path
+    raw_path, anchors, dist_safe, _ = plan_path(
+        board,
+        obs_main,
+        (shooter.x, shooter.y),
+        enemies_xy,
+        obs_mask_loose=obs_loose,
+        shrink_list=shrink_variants
+    )
+    tight_path = rdp_with_anchors(raw_path, anchors, eps=RDP_EPS)
+    smooth_path = smooth_path_away_from_obstacles(board, tight_path, dist_safe, obs_main)
+    path = rdp_with_anchors(smooth_path, list(range(len(smooth_path))), eps=RDP_EPS)
+
     base_expr, _ = build_expression_from_polyline(path)
 
-    # overlay
+    # overlay (single image)
     overlay = roi.copy() if overlay_path else None
     if overlay is not None:
         if obs_contours: cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)
-        h,w = obs_bord.shape[:2]; cv2.rectangle(overlay,(0,0),(w-1,h-1),(0,255,0),2)
+        h,w = obs_raw.shape[:2]; cv2.rectangle(overlay,(0,0),(w-1,h-1),(0,255,0),2)
         for a in actors:
             if a is shooter:
                 cv2.circle(overlay,(a.px,a.py),18,(0,215,255),3)
@@ -573,10 +635,9 @@ def solve_from_bgr(bgr: np.ndarray,
             for i in range(1,len(pts)):
                 cv2.line(overlay, pts[i-1], pts[i], (0,0,255), 2)
 
-    # flex
     flex_expr=""
     if flex:
-        flex_expr = insert_flex_hearts(board, dist_map, path, overlay)
+        flex_expr = insert_flex_hearts(board, dist_safe, path, overlay)
     final_expr = base_expr if not flex_expr else (base_expr + " + " + flex_expr).replace("+-","-").replace("--","+").strip(" +")
 
     if overlay is not None:
@@ -587,7 +648,7 @@ def solve_from_bgr(bgr: np.ndarray,
 
 # ---------- cli ----------
 def main():
-    parser = argparse.ArgumentParser(description="Graphwar solver (name-tag fix + best-effort)")
+    parser = argparse.ArgumentParser(description="Graphwar solver (tag-proof + separate border inflation)")
     parser.add_argument("--xrange", nargs=2, type=float, default=[-25.0, 25.0])
     parser.add_argument("--yrange", nargs=2, type=float, default=[-15.0, 15.0])
     parser.add_argument("--min_area", type=int, default=60)

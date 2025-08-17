@@ -45,6 +45,10 @@ HEART_GATE_A    = 80.0
 HEART_GATE_D    = 0.5
 
 BEST_EFFORT_MAX_EXPANSIONS = 120000
+
+# New: “must-cross-enemy” x offsets (units)
+X_PRE_EPS       = 0.35      # aim just before enemy x
+X_POST_EPS      = 0.25      # step just after enemy x
 # --------------------------------------------------
 
 # ---------- capture ----------
@@ -138,7 +142,6 @@ def _remove_axes(mask: np.ndarray) -> np.ndarray:
     return mask
 
 def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float=MIN_THICK_PX) -> np.ndarray:
-    # Correct unpack order: num, labels
     num, labels = cv2.connectedComponents(shape_mask)
     keep = np.zeros_like(shape_mask)
     for i in range(1, num):
@@ -159,19 +162,14 @@ def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float=MIN_THICK_PX)
     return keep
 
 def obstacle_mask_and_contours(roi_bgr: np.ndarray):
-    """Dark obstacles from HSV V<60, axes removed, labels’ thin strokes erased, thin comps filtered."""
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     v = hsv[:,:,2]
     mask = np.uint8((v < 60) * 255)  # true black fill only
-
-    # Close small holes inside obstacles, but keep kernel tiny so we don't bridge gaps
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=1)
-
     mask = _remove_axes(mask)
     mask = remove_thin_dark_near_labels(mask, roi_bgr, pad=24, dilate=50)
     mask = _keep_by_thickness(mask, MIN_THICK_PX)
-
     contours,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     clean = np.zeros_like(mask)
     cv2.drawContours(clean, contours, -1, 255, thickness=cv2.FILLED)
@@ -325,7 +323,7 @@ def build_occupancy_and_cost(board: Board, obs_mask: np.ndarray,
     ys = np.arange(board.y_range[0], board.y_range[1]+1e-9, dy)
     free=(obs_mask==0).astype(np.uint8)*255
     dist=cv2.distanceTransform(free, cv2.DIST_L2, 5)
-    dist_norm=dist/dist.max() if dist.max()>0 else dist
+    dist_norm=dist/dist.max() if dist.max() > 0 else dist
     occ=np.zeros((len(ys),len(xs)),dtype=np.uint8)
     cost=np.zeros_like(occ,dtype=np.float32)
     for j,y in enumerate(ys):
@@ -509,20 +507,40 @@ def plan_path(board: Board,
 
     path=[(sx,sy)]; anchors=[0]; curx,cury=sx,sy
     for col in cols:
-        xg=max(p[0] for p in col)
-        remaining=col[:]
+        # representative x of this column
+        xcol = float(np.mean([x for x,_ in col]))
+        x_pre  = xcol - X_PRE_EPS
+        x_post = xcol + X_POST_EPS
+
+        # visit enemies in this column, choosing next by nearest vertical move
+        remaining = col[:]
         while remaining:
             remaining.sort(key=lambda p: abs(p[1]-cury))
-            tx,ty=remaining.pop(0)
-            mask_variants=[obs_mask_main]
-            if obs_mask_loose is not None: mask_variants.append(obs_mask_loose)
-            if shrink_list: mask_variants.extend(shrink_list)
-            seg = try_route_variants(board, mask_variants, (curx,cury), (xg,ty), require_progress=True)
-            if seg:
-                if path: seg=seg[1:]
-                path.extend(seg); anchors.append(len(path)-1)
-                curx,cury=path[-1]
-        # if none worked, this column is skipped
+            ex,ey = remaining.pop(0)
+
+            # 1) try to reach just before the enemy x at the enemy y
+            goal1 = (x_pre, ey)
+            masks = [obs_mask_main]
+            if obs_mask_loose is not None: masks.append(obs_mask_loose)
+            if shrink_list: masks.extend(shrink_list)
+            seg1 = try_route_variants(board, masks, (curx,cury), goal1, require_progress=True)
+
+            if seg1:
+                if path: seg1 = seg1[1:]
+                path.extend(seg1); anchors.append(len(path)-1)
+                curx,cury = path[-1]
+            else:
+                # couldn't get to this one; skip to next in column
+                continue
+
+            # 2) try to step slightly through the column (ensures we cross x_enemy)
+            goal2 = (x_post, cury)
+            seg2 = try_route_variants(board, masks, (curx,cury), goal2, require_progress=False)
+            if seg2:
+                if path: seg2 = seg2[1:]
+                path.extend(seg2); anchors.append(len(path)-1)
+                curx,cury = path[-1]
+
     return path,anchors,dist_safe,obs_mask_main
 
 # ---------- hearts ----------
@@ -648,7 +666,7 @@ def solve_from_bgr(bgr: np.ndarray,
 
 # ---------- cli ----------
 def main():
-    parser = argparse.ArgumentParser(description="Graphwar solver (tag-proof + separate border inflation)")
+    parser = argparse.ArgumentParser(description="Graphwar solver (tag-proof + separate border inflation + enemy pre-goals)")
     parser.add_argument("--xrange", nargs=2, type=float, default=[-25.0, 25.0])
     parser.add_argument("--yrange", nargs=2, type=float, default=[-15.0, 15.0])
     parser.add_argument("--min_area", type=int, default=60)

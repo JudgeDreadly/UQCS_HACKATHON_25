@@ -1,9 +1,28 @@
 #!/usr/bin/env python3
+# STEP-ONLY Graphwar solver (enemy-first; no obstacle crossing; multiple hearts)
+# -----------------------------------------------------------------------------
+# - Auto-captures the primary monitor.
+# - Detects board, obstacles (labels filtered), allies/enemies, and shooter.
+# - Plans a staircase path that visits enemies in ascending X:
+#     go to (x_pre, y_enemy) then cross to (x_post, y_enemy)
+#   Path uses A* with moves {Right, Up, Down} only → realizable via STEP terms.
+# - Converts the staircase to exact STEP primitives:
+#     k/(1+exp(-a*(x - x_step)))  with a=69 and k = exact Δy
+#   Each step is placed inside the following horizontal run at the clearest x,
+#   and a collision “tube” around the sigmoid is checked against obstacles.
+# - Overlay draws y = f(x) - f(xs) + ys (Graphwar’s auto-translation), so it
+#   matches the in-game curve exactly.
+# - If --flex, places multiple asymmetric hearts on long flat spans:
+#     width: ±3 in x, height: +2 up, -4 down; skips if an ally is inside.
+#   Overlay writes “Heart” where each will appear.
+#
+# Output: JSON -> {"actors":[...], "expr":"..."} and one overlay image.
+
 import argparse
 import json
 import math
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 import numpy as np
 
@@ -12,44 +31,48 @@ try:
 except Exception:
     cv2 = None
 
-# -------------------- tunables --------------------
-ENEMY_RADIUS    = 0.8      # units; leeway ring for enemy hits (visual only)
-X_GROUP_TOL     = 0.6      # group enemies by x within this tolerance
+# ---------------- tunables ----------------
+ENEMY_RADIUS    = 0.8
+RDP_EPS         = 0.45
 
-# Grid & path cost
 GRID_DX         = 0.20
 GRID_DY         = 0.20
-PROX_WEIGHT     = 6.0
+
 TURN_PENALTY    = 0.20
 ORIENT_PENALTY_VERT = 0.20
 ORIENT_BONUS_HORZ   = 0.15
 
-# Map border / obstacle shaping
 BORDER_THICK_PX = 8
 INFLATE_PX      = 2
 INFLATE_PX_LO   = 1
 SHRINK_STEPS    = 6
 MIN_THICK_PX    = 6.0
 
-# --- STEP-ONLY settings ---
-STEP_STEEPNESS       = 69.0   # 'a' in k/(1+exp(-a*(x-c)))
-STEP_EPS_DY          = 0.35   # ignore tiny vertical changes
-STEP_OFFSET_FIRST    = 0.25   # first step must not be at shooter's x
-STEP_OFFSET          = 0.12   # default offset for later steps
-STEP_MAX_OFFSET_FRAC = 0.33   # at most 33% into the next span
-STEP_MIN_GAP_AFTER   = 0.05   # keep step a bit before the next vertex
+# logistic STEP
+STEP_STEEPNESS       = 69.0
+STEP_EPS_DY          = 0.30
+STEP_OFFSET_FIRST    = 0.25  # first step offset so shooter isn’t exactly on it
+STEP_OFFSET          = 0.12
+STEP_MIN_GAP_AFTER   = 0.05
+STEP_MAX_OFFSET_FRAC = 0.33
+MERGE_DX             = 0.60
 
-# Smoothing of geometric path (for nicer long straights)
-SMOOTH_ITERS    = 3
-SMOOTH_STEP_PX  = 1.5
-SMOOTH_MAX_DY   = 2.0
+# “near” obstacle band for cost; prevents over-penalizing open space
+PROX_TAU_PX     = 18.0
+PROX_WEIGHT     = 6.0
 
 BEST_EFFORT_MAX_EXPANSIONS = 120000
 
-# “must-cross-enemy” x offsets (units)
+# enemy crossing window
 X_PRE_EPS       = 0.35
 X_POST_EPS      = 0.25
-# --------------------------------------------------
+
+# heart packing (asymmetric footprint around center a at plateau y)
+HEART_HALF_W   = 3.0
+HEART_UP       = 2.0
+HEART_DOWN     = 4.0
+HEART_GAP      = 0.6  # min gap from edges/other hearts
+# ------------------------------------------
 
 # ---------- capture ----------
 def capture_fullscreen_bgr() -> np.ndarray:
@@ -58,8 +81,8 @@ def capture_fullscreen_bgr() -> np.ndarray:
     except Exception as e:
         raise RuntimeError("Screenshot capture requires: pip install mss") from e
     with mss.mss() as sct:
-        sct_img = sct.grab(sct.monitors[1])  # primary monitor
-        frame = np.array(sct_img)            # BGRA
+        sct_img = sct.grab(sct.monitors[1])
+        frame = np.array(sct_img)  # BGRA
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
 # ---------- data ----------
@@ -82,7 +105,7 @@ class Board:
 class Actor:
     x: float; y: float; side: str; px: int; py: int; area: int = 0
 
-# ---------- ROI / board ----------
+# ---------- board ROI ----------
 def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
     if cv2 is None:
         raise RuntimeError("Requires OpenCV.")
@@ -97,7 +120,7 @@ def find_board_roi(img_bgr: np.ndarray) -> Tuple['Board', np.ndarray]:
     roi = img_bgr[y:y+h, x:x+w].copy()
     return Board(x0=x, y0=y, w=w, h=h, x_range=(-25.0,25.0), y_range=(-15.0,15.0)), roi
 
-# ---------- label detection & thin-stroke removal ----------
+# ---------- label cleanup ----------
 def detect_white_labels(roi_bgr: np.ndarray) -> List[Tuple[int,int,int,int]]:
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([0, 0, 185]), np.array([179, 120, 255]))
@@ -147,7 +170,7 @@ def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float=MIN_THICK_PX)
     for i in range(1, num):
         comp = np.uint8(labels == i) * 255
         area = int((comp > 0).sum())
-        if area < 80:
+        if area < 80:  # specks
             continue
         cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not cnts:
@@ -164,7 +187,7 @@ def _keep_by_thickness(shape_mask: np.ndarray, min_thick_px: float=MIN_THICK_PX)
 def obstacle_mask_and_contours(roi_bgr: np.ndarray):
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     v = hsv[:,:,2]
-    mask = np.uint8((v < 60) * 255)  # true black fill only
+    mask = np.uint8((v < 60) * 255)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((3,3), np.uint8), iterations=1)
     mask = _remove_axes(mask)
@@ -217,7 +240,7 @@ def classify_by_center(actors: List[Actor])->None:
     for a in actors:
         a.side = "ally" if a.x<0 else "enemy"
 
-# ---------- aura shooter ----------
+# ---------- shooter ----------
 def red_mask(roi_bgr: np.ndarray)->np.ndarray:
     hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
     m1 = cv2.inRange(hsv, np.array([0,60,70]),   np.array([12,255,255]))
@@ -255,93 +278,24 @@ def choose_shooter_by_red_ring(roi_bgr: np.ndarray, actors: List[Actor])->Option
 def choose_leftmost(actors: List[Actor])->Optional[Actor]:
     return min(actors, key=lambda t:t.x) if actors else None
 
-# ---------- STEP-ONLY expression ----------
-def steps_from_path(points: List[Tuple[float,float]]) -> List[Tuple[float,float]]:
-    """
-    Convert a monotone-x path into a sequence of steps.
-    Each step: (x_step, k), where k is the vertical jump applied at x_step.
-    """
-    steps: List[Tuple[float,float]] = []
-    if len(points) < 2:
-        return steps
-
-    for i in range(len(points)-1):
-        x1,y1 = points[i]
-        x2,y2 = points[i+1]
-        if x2 <= x1 + 1e-6:
-            continue  # ignore non-forward moves
-        dy = y2 - y1
-        if abs(dy) < STEP_EPS_DY:
-            continue  # keep long straights: no step if almost flat
-
-        dx = x2 - x1
-        # choose a step location within (x1, x2]
-        if i == 0:
-            base_off = STEP_OFFSET_FIRST
-        else:
-            base_off = STEP_OFFSET
-        max_off = max(base_off, min(STEP_MAX_OFFSET_FRAC*dx, dx - STEP_MIN_GAP_AFTER))
-        x_step = x1 + max_off
-        steps.append((x_step, dy))
-    return steps
-
-def build_step_expression(steps: List[Tuple[float,float]]) -> str:
-    if not steps:
-        return "0"
-    parts=[]
-    for (x_step,k) in steps:
-        # k/(1+exp(-a*(x - x_step)))  -> using (x + c) form with c=-x_step
-        c = -x_step
-        parts.append(f"{k:.4f}/(1+exp(-{STEP_STEEPNESS:.0f}*(x+({c:+.4f}))))")
-    expr = " + ".join(parts)
-    return expr.replace("+-","-").replace("--","+")
-
-def eval_steps(xs: np.ndarray, steps: List[Tuple[float,float]], y0: float) -> np.ndarray:
-    y = np.full_like(xs, y0, dtype=float)
-    if not steps:
-        return y
-    for (x_step,k) in steps:
-        y += k / (1.0 + np.exp(-STEP_STEEPNESS*(xs - x_step)))
-    return y
-
-# ---------- RDP ----------
-def rdp_segment(points: List[Tuple[float,float]], eps: float)->List[Tuple[float,float]]:
-    if len(points)<3: return points[:]
-    def dist(p,a,b):
-        (x,y),(x1,y1),(x2,y2) = p,a,b
-        if x1==x2 and y1==y2: return math.hypot(x-x1, y-y1)
-        t=((x-x1)*(x2-x1)+(y-y1)*(y2-y1))/((x2-x1)**2+(y2-y1)**2)
-        t=max(0.0,min(1.0,t))
-        xp,yp = x1+t*(x2-x1), y1+t*(y2-y1)
-        return math.hypot(x-xp,y-yp)
-    a,b = points[0],points[-1]
-    idx,dmax=0,0.0
-    for i in range(1,len(points)-1):
-        d=dist(points[i],a,b)
-        if d>dmax: idx,dmax=i,d
-    if dmax>eps:
-        left=rdp_segment(points[:idx+1],eps)
-        right=rdp_segment(points[idx:],eps)
-        return left[:-1]+right
-    return [a,b]
-
-# ---------- grid / A* ----------
+# ---------- grid / cost ----------
 def build_occupancy_and_cost(board: Board, obs_mask: np.ndarray,
-                             dx: float=GRID_DX, dy: float=GRID_DY, w_prox: float=PROX_WEIGHT):
+                             dx: float=GRID_DX, dy: float=GRID_DY,
+                             w_prox: float=PROX_WEIGHT, tau_px: float=PROX_TAU_PX):
     xs = np.arange(board.x_range[0], board.x_range[1]+1e-9, dx)
     ys = np.arange(board.y_range[0], board.y_range[1]+1e-9, dy)
-    free=(obs_mask==0).astype(np.uint8)*255
-    dist=cv2.distanceTransform(free, cv2.DIST_L2, 5)
-    dist_norm=dist/dist.max() if dist.max() > 0 else dist
-    occ=np.zeros((len(ys),len(xs)),dtype=np.uint8)
-    cost=np.zeros_like(occ,dtype=np.float32)
-    for j,y in enumerate(ys):
-        for i,x in enumerate(xs):
-            px,py=board.xy_to_px(x,y)
-            px=int(np.clip(px,0,board.w-1)); py=int(np.clip(py,0,board.h-1))
-            occ[j,i] = 1 if obs_mask[py,px]>0 else 0
-            prox = 1.0 - float(dist_norm[py,px])
-            cost[j,i]=1.0 + w_prox*(prox**2)
+
+    free = (obs_mask == 0).astype(np.uint8) * 255
+    dist = cv2.distanceTransform(free, cv2.DIST_L2, 5)  # px to nearest obstacle/border
+
+    # penalize only when near obstacles
+    near = np.clip((tau_px - dist) / max(1.0, tau_px), 0.0, 1.0)
+    penal = (near ** 2) * w_prox
+
+    px = np.clip(((xs - board.x_range[0]) / (board.x_range[1]-board.x_range[0]) * (board.w-1)).round().astype(int), 0, board.w-1)
+    py = np.clip(((board.y_range[1]-ys) / (board.y_range[1]-board.y_range[0]) * (board.h-1)).round().astype(int), 0, board.h-1)
+    occ = (obs_mask[np.ix_(py, px)] > 0).astype(np.uint8)
+    cost = 1.0 + penal[np.ix_(py, px)].astype(np.float32)
     return xs,ys,occ,cost,dist
 
 def nearest_idx(xs,ys,x,y):
@@ -376,7 +330,7 @@ def astar_monotone(xs,ys,occ,cost,start,goal,dir_sign:int):
     from heapq import heappush, heappop
     si,sj=start; gi,gj=goal
     W,H=len(xs),len(ys)
-    moves=[(dir_sign,0),(dir_sign,+1),(dir_sign,-1),(0,+1),(0,-1)]
+    moves=[(dir_sign,0),(0,+1),(0,-1)]  # Right/Up/Down only
     g={(si,sj):0.0}; came={}; pq=[]
     def h(i,j): return abs(gi-i)+abs(gj-j)
     heappush(pq,(h(si,sj),(si,sj),(0,0))); seen=set()
@@ -410,7 +364,7 @@ def best_effort_toward(xs,ys,occ,cost,start,goal,dir_sign:int, max_exp:int=BEST_
     from heapq import heappush, heappop
     si,sj=start; gi,gj=goal
     W,H=len(xs),len(ys)
-    moves=[(dir_sign,0),(dir_sign,+1),(dir_sign,-1),(0,+1),(0,-1)]
+    moves=[(dir_sign,0),(0,+1),(0,-1)]
     g={(si,sj):0.0}; came={}; pq=[]
     def h(i,j): return abs(gi-i)+abs(gj-j)
     heappush(pq,(h(si,sj),(si,sj),(0,0))); seen=set()
@@ -441,149 +395,307 @@ def best_effort_toward(xs,ys,occ,cost,start,goal,dir_sign:int, max_exp:int=BEST_
     path.append((si,sj)); path.reverse()
     return [(xs[ii],ys[jj]) for (ii,jj) in path]
 
-# ---------- enemy grouping ----------
-def group_enemies_by_x(enemies_xy: List[Tuple[float,float]], start_x: float, x_tol: float=X_GROUP_TOL):
-    cand=[p for p in enemies_xy if p[0]>=start_x]; cand.sort(key=lambda p:p[0])
-    cols=[]; cur=[]; cur_x=None
-    for x,y in cand:
-        if cur_x is None or abs(x-cur_x)<=x_tol:
-            cur.append((x,y)); cur_x = x if cur_x is None else (cur_x+x)/2.0
-        else:
-            cols.append(cur); cur=[(x,y)]; cur_x=x
-    if cur: cols.append(cur)
-    return cols
-
-# ---------- smoothing ----------
-def smooth_path_away_from_obstacles(board: Board,
-                                    path: List[Tuple[float,float]],
-                                    dist_map: np.ndarray,
-                                    obs_mask: np.ndarray) -> List[Tuple[float,float]]:
-    if len(path)<3: return path[:]
-    smoothed = path[:]
-    dm = cv2.GaussianBlur(dist_map.astype(np.float32), (0,0), 1.0)
-    gy, gx = np.gradient(dm)
-    units_per_px_x = (board.x_range[1]-board.x_range[0])/board.w
-    units_per_px_y = (board.y_range[1]-board.y_range[0])/board.h
-    for _ in range(SMOOTH_ITERS):
-        for i in range(1, len(smoothed)-1):
-            x,y = smoothed[i]
-            px,py = board.xy_to_px(x,y)
-            px=np.clip(px,0,board.w-1); py=np.clip(py,0,board.h-1)
-            gxv = float(gx[py,px]); gyv = float(gy[py,px])
-            mag = math.hypot(gxv, gyv)
-            if mag < 1e-6: continue
-            dx_px = (gxv/mag)*SMOOTH_STEP_PX
-            dy_px = -(gyv/mag)*SMOOTH_STEP_PX
-            dx = dx_px*units_per_px_x
-            dy = dy_px*units_per_px_y
-            nx = max(smoothed[i-1][0]+1e-4, min(smoothed[i+1][0]-1e-4, x + max(0.0, dx)))
-            ny = y + np.clip(dy, -SMOOTH_MAX_DY, SMOOTH_MAX_DY)
-            npx,npy = board.xy_to_px(nx,ny)
-            npx=np.clip(npx,0,board.w-1); npy=np.clip(npy,0,board.h-1)
-            if obs_mask[npy,npx]==0:
-                smoothed[i]=(nx,ny)
-    return smoothed
-
-# ---------- plan path ----------
-def try_route_variants(board, base_masks: List[np.ndarray],
-                       start_xy: Tuple[float,float], goal_xy: Tuple[float,float],
-                       require_progress: bool=True) -> List[Tuple[float,float]]:
-    sx,sy=start_xy; gx,gy=goal_xy
-    best=[]
-    for mask in base_masks:
-        xs,ys,occ,cost,_ = build_occupancy_and_cost(board, mask, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
-        si,sj=nearest_idx(xs,ys,sx,sy); gi,gj=nearest_idx(xs,ys,gx,gy)
-        si,sj=snap_to_free(occ,si,sj,6); gi,gj=snap_to_free(occ,gi,gj,6)
-        seg=astar_monotone(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
-        if seg and (not require_progress or (seg[-1][0]-sx) >= GRID_DX*2):
-            return seg
-        seg=best_effort_toward(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
-        if seg and (seg[-1][0]-sx) > (best[-1][0]-sx if best else 0.0):
-            best=seg
-    return best
-
-def plan_path(board: Board,
-              obs_mask_main: np.ndarray,
-              soldier_xy: Tuple[float,float],
-              enemies_xy: List[Tuple[float,float]],
-              obs_mask_loose: Optional[np.ndarray]=None,
-              shrink_list: Optional[List[np.ndarray]]=None
-              ) -> Tuple[List[Tuple[float,float]], List[int], np.ndarray, np.ndarray]:
-    xs0,ys0,occ0,cost0,dist_safe = build_occupancy_and_cost(board, obs_mask_main, dx=GRID_DX, dy=GRID_DY, w_prox=PROX_WEIGHT)
+# ---------- path planning: enemy-first ----------
+def plan_enemy_first(board: Board,
+                     obs_mask_main: np.ndarray,
+                     soldier_xy: Tuple[float,float],
+                     enemies_xy: List[Tuple[float,float]],
+                     obs_mask_loose: Optional[np.ndarray]=None,
+                     shrink_list: Optional[List[np.ndarray]]=None
+                     ) -> Tuple[List[Tuple[float,float]], List[float], np.ndarray]:
+    """
+    Visit enemies left->right. For each enemy E(xe, ye):
+      1) route to (xe - eps_pre, ye)
+      2) then cross to (xe + eps_post, ye)
+    Returns: grid path, list of all x_pre values (for step bias), dist map.
+    """
+    _,_,_,_,dist_safe = build_occupancy_and_cost(board, obs_mask_main, dx=GRID_DX, dy=GRID_DY)
 
     sx,sy=soldier_xy
-    cols=group_enemies_by_x(enemies_xy,start_x=sx,x_tol=X_GROUP_TOL)
+    targets = sorted(enemies_xy, key=lambda p: p[0])  # left -> right
 
-    path=[(sx,sy)]; anchors=[0]; curx,cury=sx,sy
-    for col in cols:
-        xcol = float(np.mean([x for x,_ in col]))
-        x_pre  = xcol - X_PRE_EPS
-        x_post = xcol + X_POST_EPS
+    path=[(sx,sy)]
+    pre_x_list=[]
+    curx,cury=sx,sy
+    for (xe, ye) in targets:
+        x_pre  = xe - X_PRE_EPS
+        x_post = xe + X_POST_EPS
+        pre_x_list.append(x_pre)
 
-        remaining = col[:]
-        while remaining:
-            remaining.sort(key=lambda p: abs(p[1]-cury))
-            ex,ey = remaining.pop(0)
+        masks=[obs_mask_main]
+        if obs_mask_loose is not None: masks.append(obs_mask_loose)
+        if shrink_list: masks.extend(shrink_list)
 
-            goal1 = (x_pre, ey)
-            masks = [obs_mask_main]
-            if obs_mask_loose is not None: masks.append(obs_mask_loose)
-            if shrink_list: masks.extend(shrink_list)
-            seg1 = try_route_variants(board, masks, (curx,cury), goal1, require_progress=True)
+        # to (x_pre, ye)
+        seg1 = try_route_variants(board, masks, (curx,cury), (x_pre, ye), require_progress=True)
+        if seg1:
+            if path: seg1 = seg1[1:]
+            path.extend(seg1); curx,cury = path[-1]
+        else:
+            # couldn't reach this enemy: skip
+            continue
 
-            if seg1:
-                if path: seg1 = seg1[1:]
-                path.extend(seg1); anchors.append(len(path)-1)
-                curx,cury = path[-1]
+        # cross to (x_post, same y)
+        seg2 = try_route_variants(board, masks, (curx,cury), (x_post, cury), require_progress=False)
+        if seg2:
+            if path: seg2 = seg2[1:]
+            path.extend(seg2); curx,cury = path[-1]
+
+    return path, pre_x_list, dist_safe
+
+# ---------- helpers for placing safe steps ----------
+STEP_TUBE_MARGIN_Y   = 0.25
+STEP_TUBE_XHALF      = 2.0*math.log(50.0)/STEP_STEEPNESS  # ~0.13 when a=69
+
+def _column_clearance_units(board: Board, dist_map: np.ndarray,
+                            x_center: float, y1: float, y2: float,
+                            half_x: float = 0.12, nx: int = 7, ny: int = 40) -> float:
+    xs = np.linspace(x_center - half_x, x_center + half_x, nx)
+    ys = np.linspace(min(y1, y2), max(y1, y2), ny)
+    min_units = float("inf")
+    units_per_px_y = (board.y_range[1] - board.y_range[0]) / board.h
+    for xx in xs:
+        for yy in ys:
+            px, py = board.xy_to_px(xx, yy)
+            px = int(np.clip(px, 0, board.w - 1))
+            py = int(np.clip(py, 0, board.h - 1))
+            d_units = float(dist_map[py, px]) * units_per_px_y
+            if d_units < min_units:
+                min_units = d_units
+    return min_units
+
+def _step_tube_clear(board: Board, obs_mask: np.ndarray,
+                     x_step: float, y_before: float, y_after: float,
+                     x_half: float = STEP_TUBE_XHALF,
+                     margin_y: float = STEP_TUBE_MARGIN_Y) -> bool:
+    xa, xb = x_step - x_half, x_step + x_half
+    ya, yb = min(y_before, y_after) - margin_y, max(y_before, y_after) + margin_y
+    xs = np.linspace(xa, xb, 13)
+    ys = np.linspace(ya, yb, 25)
+    for yy in ys:
+        for xx in xs:
+            px, py = board.xy_to_px(xx, yy)
+            px = int(np.clip(px, 0, board.w-1))
+            py = int(np.clip(py, 0, board.h-1))
+            if obs_mask[py, px] > 0:
+                return False
+    return True
+
+def _choose_clear_step_x(board: Board, dist_map: np.ndarray, obs_mask: np.ndarray,
+                         x1: float, y1: float, x2: float, y2: float,
+                         base_off: float, prefer_x: Optional[float]) -> float:
+    left  = x1 + base_off
+    right = max(left + 1e-3, x2 - STEP_MIN_GAP_AFTER)
+    if right <= left:
+        return left
+
+    cands = np.linspace(left, right, 13).tolist()
+    if prefer_x is not None:
+        cands += [np.clip(prefer_x, left, right)]
+    cands = sorted(set([float(c) for c in cands]))
+
+    best_x = left
+    best_score = -1e9
+    for xc in cands:
+        if not _step_tube_clear(board, obs_mask, xc, y1, y2):
+            continue
+        clear = _column_clearance_units(board, dist_map, xc, y1, y2, half_x=0.12)
+        bias  = -0.03*abs((prefer_x or xc) - xc)
+        score = clear + bias
+        if score > best_score:
+            best_score = score
+            best_x = xc
+
+    return best_x
+
+# ---------- grid staircase -> STEP list ----------
+def steps_from_grid_path(grid_path: List[Tuple[float,float]],
+                         enemy_pre_x: List[float],
+                         board: Board,
+                         dist_map: np.ndarray,
+                         obs_mask: np.ndarray) -> List[Tuple[float,float]]:
+    if len(grid_path) < 2: return []
+    steps: List[Tuple[float,float]] = []
+    i = 0
+    while i < len(grid_path)-1:
+        x_col = grid_path[i][0]
+        y_cur = grid_path[i][1]
+
+        # sum vertical moves at this x
+        dy_total = 0.0
+        j = i
+        while j < len(grid_path)-1 and abs(grid_path[j+1][0] - x_col) < 1e-9:
+            dy_total += (grid_path[j+1][1] - grid_path[j][1])
+            j += 1
+
+        # next right-run length
+        run_dx = 0.0
+        while j < len(grid_path)-1 and grid_path[j+1][0] > grid_path[j][0]:
+            run_dx += (grid_path[j+1][0] - grid_path[j][0])
+            j += 1
+
+        if abs(dy_total) >= STEP_EPS_DY and run_dx > 0:
+            base_off = STEP_OFFSET_FIRST if len(steps)==0 else STEP_OFFSET
+            base_off = max(base_off, min(STEP_MAX_OFFSET_FRAC*run_dx, run_dx - STEP_MIN_GAP_AFTER))
+            prefer = None
+            for xp in enemy_pre_x:
+                if abs((x_col+run_dx) - xp) < 0.6:
+                    prefer = np.clip(xp - 0.18, x_col + STEP_OFFSET, x_col + run_dx - STEP_MIN_GAP_AFTER)
+                    break
+
+            x_step = _choose_clear_step_x(board, dist_map, obs_mask,
+                                          x_col, y_cur, x_col + run_dx, y_cur + dy_total,
+                                          base_off, prefer)
+            tries = 0
+            while not _step_tube_clear(board, obs_mask, x_step, y_cur, y_cur + dy_total) and tries < 4:
+                x_step = min(x_step + 0.08, x_col + run_dx - STEP_MIN_GAP_AFTER)
+                tries += 1
+            steps.append((x_step, dy_total))
+
+        i = j
+
+    return steps
+
+def merge_steps(steps: List[Tuple[float,float]]) -> List[Tuple[float,float]]:
+    if not steps: return steps
+    steps = sorted(steps, key=lambda t:t[0])
+    merged=[]
+    cur_x,cur_k = steps[0]
+    for x,k in steps[1:]:
+        if (x - cur_x) <= MERGE_DX and (k*cur_k) > 0:
+            cur_k += k
+            cur_x = max(cur_x, x)
+        else:
+            if abs(cur_k) >= STEP_EPS_DY:
+                merged.append((cur_x, cur_k))
+            cur_x,cur_k = x,k
+    if abs(cur_k) >= STEP_EPS_DY:
+        merged.append((cur_x, cur_k))
+    out=[]; last_x=-1e9
+    for x,k in merged:
+        x = max(x, last_x + 1e-4)
+        out.append((x,k)); last_x = x
+    return out
+
+# ---------- step math ----------
+def build_step_expression(steps: List[Tuple[float,float]]) -> str:
+    if not steps:
+        return "0"
+    parts=[]
+    for (x_step,k) in steps:
+        parts.append(f"{k:.4f}/(1+exp(-{STEP_STEEPNESS:.0f}*(x-({x_step:.4f}))))")
+    expr = " + ".join(parts)
+    return expr.replace("+-","-").replace("--","+")
+
+def f_steps(xs: np.ndarray, steps: List[Tuple[float,float]]) -> np.ndarray:
+    y = np.zeros_like(xs, dtype=float)
+    for (x_step,k) in steps:
+        y += k / (1.0 + np.exp(-STEP_STEEPNESS*(xs - x_step)))
+    return y
+
+def eval_steps_autotranslated(xs: np.ndarray, steps: List[Tuple[float,float]],
+                              xs0: float, y0: float) -> np.ndarray:
+    f = f_steps(xs, steps)
+    f0 = float(f_steps(np.array([xs0]), steps)[0])
+    return f - f0 + y0
+
+def plateaus_from_steps(steps: List[Tuple[float,float]], x0: float, x1: float, y0: float):
+    segs=[]
+    cur_x=x0; cur_y=y0
+    for (xs,k) in steps:
+        if xs>cur_x:
+            segs.append((cur_x, xs, cur_y))
+        cur_y += k
+        cur_x = xs
+    if cur_x<x1:
+        segs.append((cur_x, x1, cur_y))
+    return segs
+
+# ---------- hearts ----------
+def heart_expr_at(a: float) -> str:
+    # exact form supplied by you; center at x=a
+    return (
+        f"0.4*((abs(x-({a:.4f}))-1.5)-abs(abs(x-({a:.4f}))-1.5))"
+        f"+sqrt(2.25-(1.5+0.4*((abs(x-({a:.4f}))-1.5)-abs(abs(x-({a:.4f}))-1.5)))^2)*cos(30*x)"
+    )
+
+def _heart_box_clear(board: Board, obs_mask: np.ndarray,
+                     a: float, y: float,
+                     half_w: float = HEART_HALF_W, up: float = HEART_UP, down: float = HEART_DOWN,
+                     margin: float = 0.2) -> bool:
+    xs = np.linspace(a - half_w - margin, a + half_w + margin, 18)
+    ys = np.linspace(y - down - margin, y + up + margin, 18)
+    for yy in ys:
+        for xx in xs:
+            px,py=board.xy_to_px(xx,yy)
+            px = int(np.clip(px,0,board.w-1)); py = int(np.clip(py,0,board.h-1))
+            if obs_mask[py,px] > 0:
+                return False
+    return True
+
+def _ally_in_box(a: float, y: float, allies: List[Tuple[float,float]],
+                 half_w: float = HEART_HALF_W, up: float = HEART_UP, down: float = HEART_DOWN,
+                 margin: float = 0.2) -> bool:
+    L=a-half_w-margin; R=a+half_w+margin
+    B=y-down-margin;   T=y+up+margin
+    for (ax,ay) in allies:
+        if L<=ax<=R and B<=ay<=T:
+            return True
+    return False
+
+def insert_hearts(board: Board, obs_mask: np.ndarray,
+                  steps: List[Tuple[float,float]],
+                  x0: float, x1: float, y0: float,
+                  overlay: Optional[np.ndarray],
+                  ally_pts: List[Tuple[float,float]]) -> str:
+    exprs=[]
+    segs=plateaus_from_steps(steps, x0, x1, y0)
+    stride = 2*HEART_HALF_W + HEART_GAP
+    for (L,R,y) in segs:
+        usable_L = L + HEART_GAP + HEART_HALF_W
+        usable_R = R - HEART_GAP - HEART_HALF_W
+        a = usable_L
+        while a <= usable_R + 1e-9:
+            if (not _ally_in_box(a,y,ally_pts)) and _heart_box_clear(board, obs_mask, a, y):
+                exprs.append(heart_expr_at(a))
+                if overlay is not None:
+                    px,py = board.xy_to_px(a,y)
+                    cv2.putText(overlay,"Heart",(px-18,py-6),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,0,200),2,cv2.LINE_AA)
+                a += stride
             else:
-                continue
+                a += 0.5
+    return (" + ".join(exprs)).replace("+-","-").replace("--","+")
 
-            goal2 = (x_post, cury)
-            seg2 = try_route_variants(board, masks, (curx,cury), goal2, require_progress=False)
-            if seg2:
-                if path: seg2 = seg2[1:]
-                path.extend(seg2); anchors.append(len(path)-1)
-                curx,cury = path[-1]
-
-    return path,anchors,dist_safe,obs_mask_main
-
-# ---------- solve ----------
+# ---------- high-level solve ----------
 def solve_from_bgr(bgr: np.ndarray,
-                   x_range: Tuple[float,float]=(-25.0,25.0), y_range: Tuple[float,float]=(-15.0,15.0),
-                   min_area: int=60, overlay_path: Optional[str]=None)->dict:
+                   x_range: Tuple[float,float]=(-25.0,25.0),
+                   y_range: Tuple[float,float]=(-15.0,15.0),
+                   min_area: int=60,
+                   overlay_path: Optional[str]=None,
+                   flex: bool=False)->dict:
     if cv2 is None: raise RuntimeError("Requires OpenCV.")
     board,roi = find_board_roi(bgr); board.x_range=x_range; board.y_range=y_range
 
     # obstacles
     obs_raw,obs_contours = obstacle_mask_and_contours(roi)
-
-    # border (never inflated)
     border_only = add_border_mask(obs_raw.shape, px=BORDER_THICK_PX)
-
-    # inflate ONLY obstacles, then OR with border
-    obs_infl_main  = inflate(obs_raw, INFLATE_PX)
-    obs_infl_loose = inflate(obs_raw, INFLATE_PX_LO)
-    obs_main  = cv2.bitwise_or(obs_infl_main,  border_only)
-    obs_loose = cv2.bitwise_or(obs_infl_loose, border_only)
-
-    # progressive shrink variants (obstacles only), then add border
+    obs_main  = cv2.bitwise_or(inflate(obs_raw, INFLATE_PX),  border_only)
+    obs_loose = cv2.bitwise_or(inflate(obs_raw, INFLATE_PX_LO), border_only)
     shrinks = shrink_obstacles_only(obs_raw, SHRINK_STEPS)
     shrink_variants = [cv2.bitwise_or(s, border_only) for s in shrinks]
 
     # actors
     actors = detect_actors(roi, min_area=min_area)
     assign_coords(board, actors); classify_by_center(actors)
-
     shooter = choose_shooter_by_red_ring(roi, actors)
     if shooter is None:
         left_allies=[a for a in actors if a.side=="ally"]
         shooter = choose_leftmost(left_allies) or choose_leftmost(actors)
     if shooter is None: raise RuntimeError("No actors detected.")
-
     enemies_xy=[(a.x,a.y) for a in actors if a.side=="enemy"]
 
-    # plan path (geometric)
-    raw_path, anchors, dist_safe, _ = plan_path(
+    # enemy-first staircase path
+    grid_path, pre_x_list, dist_safe = plan_enemy_first(
         board,
         obs_main,
         (shooter.x, shooter.y),
@@ -592,19 +704,17 @@ def solve_from_bgr(bgr: np.ndarray,
         shrink_list=shrink_variants
     )
 
-    # simplify a bit (keeps long straights)
-    tight_path = rdp_segment(raw_path, eps=0.45)
-    smooth_path = smooth_path_away_from_obstacles(board, tight_path, dist_safe, obs_main)
+    # grid -> steps
+    steps_raw   = steps_from_grid_path(grid_path, pre_x_list, board, dist_safe, obs_main)
+    steps_final = merge_steps(steps_raw)
+    expr  = build_step_expression(steps_final)
 
-    # ---- STEP-ONLY conversion ----
-    steps = steps_from_path(smooth_path)
-    expr  = build_step_expression(steps)
-
-    # overlay (draw what the *function* will do)
+    # overlay
     overlay = roi.copy() if overlay_path else None
     if overlay is not None:
         if obs_contours: cv2.drawContours(overlay, obs_contours, -1, (0,255,0), 2)
         h,w = obs_raw.shape[:2]; cv2.rectangle(overlay,(0,0),(w-1,h-1),(0,255,0),2)
+
         for a in actors:
             if a is shooter:
                 cv2.circle(overlay,(a.px,a.py),18,(0,215,255),3)
@@ -618,10 +728,9 @@ def solve_from_bgr(bgr: np.ndarray,
                 rpx=int((ENEMY_RADIUS/(board.x_range[1]-board.x_range[0]))*board.w)
                 cv2.circle(overlay,(a.px,a.py),max(6,rpx),(0,140,255),1)
 
-        # draw the predicted step-curve
+        # draw y = f(x) - f(xs) + ys
         xs = np.linspace(board.x_range[0], board.x_range[1], 1600)
-        ys = eval_steps(xs, steps, y0=shooter.y)
-        # keep inside board
+        ys = eval_steps_autotranslated(xs, steps_final, xs0=shooter.x, y0=shooter.y)
         msk = (ys>=board.y_range[0]) & (ys<=board.y_range[1])
         xs,ys = xs[msk], ys[msk]
         if len(xs)>=2:
@@ -631,23 +740,53 @@ def solve_from_bgr(bgr: np.ndarray,
                 cv2.line(overlay, p0, p1, (0,0,255), 2)
                 p0 = p1
 
-        # draw step centers for clarity
-        for (x_step, k) in steps:
-            px,py = board.xy_to_px(x_step, shooter.y)
-            cv2.line(overlay,(px,0),(px,board.h-1),(50,50,255),1)
+        for (x_step, _) in steps_final:
+            px,_ = board.xy_to_px(x_step, 0)
+            cv2.line(overlay,(px,0),(px,board.h-1),(80,80,200),1)
 
+    # hearts (after we guarantee enemies)
+    if flex and overlay is not None:
+        ally_pts = [(a.x,a.y) for a in actors if a.side=="ally"]
+        heart_expr = insert_hearts(
+            board, obs_main, steps_final,
+            x0=shooter.x, x1=board.x_range[1], y0=shooter.y,
+            overlay=overlay, ally_pts=ally_pts
+        )
+        if heart_expr:
+            expr = (expr + " + " + heart_expr).replace("+-","-").replace("--","+").strip(" +")
+
+    if overlay is not None:
         cv2.imwrite(overlay_path, overlay)
 
     out_actors=[{"x":float(a.x),"y":float(a.y),"side":a.side,"is_shooter":(a is shooter)} for a in actors]
     return {"actors": out_actors, "expr": (expr if expr.strip() else "0")}
 
-# ---------- cli ----------
+# ---------- glue ----------
+def try_route_variants(board, base_masks: List[np.ndarray],
+                       start_xy: Tuple[float,float], goal_xy: Tuple[float,float],
+                       require_progress: bool=True) -> List[Tuple[float,float]]:
+    sx,sy=start_xy; gx,gy=goal_xy
+    best=[]
+    for mask in base_masks:
+        xs,ys,occ,cost,_ = build_occupancy_and_cost(board, mask, dx=GRID_DX, dy=GRID_DY)
+        si,sj=nearest_idx(xs,ys,sx,sy); gi,gj=nearest_idx(xs,ys,gx,gy)
+        si,sj=snap_to_free(occ,si,sj,6); gi,gj=snap_to_free(occ,gi,gj,6)
+        seg=astar_monotone(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
+        if seg and (not require_progress or (seg[-1][0]-sx) >= GRID_DX*2):
+            return seg
+        seg=best_effort_toward(xs,ys,occ,cost,(si,sj),(gi,gj),dir_sign=+1)
+        if seg and (seg[-1][0]-sx) > (best[-1][0]-sx if best else 0.0):
+            best=seg
+    return best
+
+# ---------- CLI ----------
 def main():
-    parser = argparse.ArgumentParser(description="Graphwar solver — STEP ONLY (prioritize long straights)")
+    parser = argparse.ArgumentParser(description="Graphwar STEP-only solver (enemy-first; safe steps; hearts)")
     parser.add_argument("--xrange", nargs=2, type=float, default=[-25.0, 25.0])
     parser.add_argument("--yrange", nargs=2, type=float, default=[-15.0, 15.0])
     parser.add_argument("--min_area", type=int, default=60)
     parser.add_argument("--debug_out", default="graphwar_overlay.png")
+    parser.add_argument("--flex", action="store_true", help="Insert hearts on long safe plateaus")
     args = parser.parse_args()
 
     bgr = capture_fullscreen_bgr()
@@ -657,6 +796,7 @@ def main():
         y_range=(args.yrange[0], args.yrange[1]),
         min_area=args.min_area,
         overlay_path=(args.debug_out if args.debug_out else None),
+        flex=args.flex
     )
     print(json.dumps(res, indent=2))
 
